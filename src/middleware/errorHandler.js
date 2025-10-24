@@ -1,4 +1,9 @@
-import { logger } from '../utils/logger.js';
+// Simple console logger for serverless environments
+const logger = {
+  error: (...args) => console.error('[ERROR]', ...args),
+  info: (...args) => console.log('[INFO]', ...args),
+  warn: (...args) => console.warn('[WARN]', ...args),
+};
 
 export const errorHandler = (err, req, res, next) => {
   logger.error(err.stack);
