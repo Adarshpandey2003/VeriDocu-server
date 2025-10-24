@@ -88,27 +88,13 @@ app.use('*', (req, res) => {
 // Error handling middleware
 app.use(errorHandler);
 
-// Database connection check
-const checkDatabaseConnection = async () => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    logger.info(`✓ Database connected successfully at ${result.rows[0].now}`);
-  } catch (error) {
-    logger.error(`✗ Database connection failed: ${error.message}`);
-  }
-};
-
 // Start server only if not in Vercel environment
-if (process.env.VERCEL !== '1') {
-  app.listen(PORT, async () => {
+if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
+  app.listen(PORT, () => {
     logger.info(`🚀 VeriBoard API server running on port ${PORT}`);
     logger.info(`📝 Environment: ${process.env.NODE_ENV}`);
     logger.info(`🔒 CORS enabled for: ${process.env.CORS_ORIGIN}`);
-    await checkDatabaseConnection();
   });
-} else {
-  // Initialize database connection for Vercel
-  checkDatabaseConnection();
 }
 
 export default app;
