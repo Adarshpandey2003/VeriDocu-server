@@ -15,7 +15,7 @@ router.get('/profile', protect, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT c.*, u.name, u.email 
+      `SELECT c.*, u.name, u.email
        FROM candidates c
        JOIN users u ON c.user_id = u.id
        WHERE c.user_id = $1`,
@@ -41,14 +41,45 @@ router.get('/profile', protect, async (req, res, next) => {
         profile: {
           ...createResult.rows[0],
           name: userResult.rows[0].name,
-          email: userResult.rows[0].email
+          email: userResult.rows[0].email,
+          experiences: []
         }
       });
     }
 
+    // Fetch employment history
+    const employmentResult = await pool.query(
+      `SELECT id, company_name as company, position as job_title, location,
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM employment_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [result.rows[0].id]
+    );
+
+    // Fetch education history
+    const educationResult = await pool.query(
+      `SELECT id, institution, degree, field_of_study, 
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM education_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [result.rows[0].id]
+    );
+
+    const profile = {
+      ...result.rows[0],
+      experiences: employmentResult.rows,
+      educations: educationResult.rows
+    };
+
     res.json({
       success: true,
-      profile: result.rows[0]
+      profile
     });
   } catch (error) {
     next(error);
@@ -64,7 +95,7 @@ router.put('/profile', protect, async (req, res, next) => {
       return next(new AppError('Access denied. Candidates only.', 403));
     }
 
-    const { title, bio, location, phone, linkedin_url, skills, is_public } = req.body;
+  const { professional_title, bio, location, phone, linkedin_url, skills, experiences, educations, is_public } = req.body;
 
     // Check if profile exists
     const checkProfile = await pool.query(
@@ -76,16 +107,16 @@ router.put('/profile', protect, async (req, res, next) => {
     if (checkProfile.rows.length === 0) {
       // Create profile
       result = await pool.query(
-        `INSERT INTO candidates (user_id, title, bio, location, phone, linkedin_url, skills, is_public, created_at, updated_at)
+        `INSERT INTO candidates (user_id, professional_title, bio, location, phone, linkedin_url, skills, is_public, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
          RETURNING *`,
-        [req.user.id, title, bio, location, phone, linkedin_url, skills, is_public ?? true]
+        [req.user.id, professional_title, bio, location, phone, linkedin_url, skills, is_public ?? true]
       );
     } else {
       // Update profile
       result = await pool.query(
-        `UPDATE candidates 
-         SET title = COALESCE($2, title),
+        `UPDATE candidates
+         SET professional_title = COALESCE($2, professional_title),
              bio = COALESCE($3, bio),
              location = COALESCE($4, location),
              phone = COALESCE($5, phone),
@@ -95,14 +126,105 @@ router.put('/profile', protect, async (req, res, next) => {
              updated_at = NOW()
          WHERE user_id = $1
          RETURNING *`,
-        [req.user.id, title, bio, location, phone, linkedin_url, skills, is_public]
+        [req.user.id, professional_title, bio, location, phone, linkedin_url, skills, is_public]
       );
     }
+
+    const candidateId = result.rows[0].id;
+
+    // Handle employment history
+    if (experiences && Array.isArray(experiences)) {
+      // Delete existing employment records
+      await pool.query('DELETE FROM employment_history WHERE candidate_id = $1', [candidateId]);
+
+      // Insert new employment records
+      for (const exp of experiences) {
+        if (exp.job_title && exp.description) {
+          // Convert month format to date format
+          const startDate = exp.start_month ? `${exp.start_month}-01` : null;
+          const endDate = exp.end_month ? `${exp.end_month}-01` : null;
+
+          await pool.query(
+            `INSERT INTO employment_history (candidate_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+            [
+              candidateId,
+              exp.company || null,
+              exp.job_title,
+              exp.location || null,
+              startDate,
+              endDate,
+              exp.is_current || false,
+              exp.description
+            ]
+          );
+        }
+      }
+    }
+
+    // Handle education history
+    if (educations && Array.isArray(educations)) {
+      // Delete existing education records
+      await pool.query('DELETE FROM education_history WHERE candidate_id = $1', [candidateId]);
+
+      // Insert new education records
+      for (const ed of educations) {
+        if (ed.institution && ed.degree) {
+          const startDate = ed.start_month ? `${ed.start_month}-01` : null;
+          const endDate = ed.end_month ? `${ed.end_month}-01` : null;
+
+          await pool.query(
+            `INSERT INTO education_history (candidate_id, institution, degree, field_of_study, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+            [
+              candidateId,
+              ed.institution,
+              ed.degree,
+              ed.field_of_study || null,
+              startDate,
+              endDate,
+              ed.is_current || false,
+              ed.description || null
+            ]
+          );
+        }
+      }
+    }
+
+    // Fetch updated employment history for response
+    const employmentResult = await pool.query(
+      `SELECT id, company_name as company, position as job_title, location,
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM employment_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [candidateId]
+    );
+
+    // Fetch updated education history for response
+    const educationResult = await pool.query(
+      `SELECT id, institution, degree, field_of_study, 
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM education_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [candidateId]
+    );
+
+    const profile = {
+      ...result.rows[0],
+      experiences: employmentResult.rows,
+      educations: educationResult.rows
+    };
 
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      profile: result.rows[0]
+      profile
     });
   } catch (error) {
     next(error);
@@ -115,7 +237,7 @@ router.put('/profile', protect, async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT c.*, u.name 
+      `SELECT c.*, u.name
        FROM candidates c
        JOIN users u ON c.user_id = u.id
        WHERE c.id = $1 AND c.is_public = true`,
@@ -126,9 +248,39 @@ router.get('/:id', async (req, res, next) => {
       return next(new AppError('Candidate profile not found or not public', 404));
     }
 
+    // Fetch employment history
+    const employmentResult = await pool.query(
+      `SELECT id, company_name as company, position as job_title, location,
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM employment_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [req.params.id]
+    );
+
+    // Fetch education history
+    const educationResult = await pool.query(
+      `SELECT id, institution, degree, field_of_study, 
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM education_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [req.params.id]
+    );
+
+    const profile = {
+      ...result.rows[0],
+      experiences: employmentResult.rows,
+      educations: educationResult.rows
+    };
+
     res.json({
       success: true,
-      profile: result.rows[0]
+      profile
     });
   } catch (error) {
     next(error);
