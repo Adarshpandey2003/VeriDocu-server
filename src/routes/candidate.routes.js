@@ -2,8 +2,26 @@ import express from 'express';
 import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
+import multer from 'multer';
+import { uploadProfilePicture, getProfilePictureSignedUrl } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
+
+// Configure multer for memory storage (files stored in memory as Buffer)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept only image files
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new AppError('Only image files are allowed', 400), false);
+    }
+  },
+});
 
 // @route   GET /api/candidates/profile
 // @desc    Get current candidate's profile
@@ -281,6 +299,85 @@ router.get('/:id', async (req, res, next) => {
     res.json({
       success: true,
       profile
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/candidates/profile/avatar
+// @desc    Upload profile picture for current candidate
+// @access  Private (Candidate only)
+router.post('/profile/avatar', protect, upload.single('avatar'), async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    if (!req.file) {
+      return next(new AppError('No file uploaded', 400));
+    }
+
+    const userId = req.user.id;
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+
+    // Upload to Supabase storage
+    const { data, error, path } = await uploadProfilePicture(userId, fileBuffer, fileName);
+
+    if (error) {
+      console.error('Supabase upload error:', error);
+      return next(new AppError('Failed to upload image', 500));
+    }
+
+    // Update candidate profile with the new avatar path
+    await pool.query(
+      'UPDATE candidates SET avatar_url = $1, updated_at = NOW() WHERE user_id = $2',
+      [path, userId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Profile picture uploaded successfully',
+      avatar_path: path
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/candidates/profile/avatar-url
+// @desc    Get signed URL for current candidate's profile picture
+// @access  Private (Candidate only)
+router.get('/profile/avatar-url', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    // Get the avatar path from database
+    const result = await pool.query(
+      'SELECT avatar_url FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].avatar_url) {
+      return next(new AppError('No profile picture found', 404));
+    }
+
+    const avatarPath = result.rows[0].avatar_url;
+
+    // Generate signed URL
+    const { data, error } = await getProfilePictureSignedUrl(avatarPath);
+
+    if (error) {
+      console.error('Signed URL error:', error);
+      return next(new AppError('Failed to generate access URL', 500));
+    }
+
+    res.json({
+      success: true,
+      signedUrl: data.signedUrl
     });
   } catch (error) {
     next(error);

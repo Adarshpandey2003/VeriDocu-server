@@ -20,9 +20,11 @@ const pool = new Pool({
   keepAliveInitialDelayMillis: 10000,
 });
 
-// Test connection
+// Test connection (only log in development)
 pool.on('connect', (client) => {
-  console.log('✓ Connected to PostgreSQL database');
+  if (process.env.NODE_ENV === 'development') {
+    console.log('✓ Connected to PostgreSQL database');
+  }
   // Set statement timeout to prevent long-running queries
   client.query('SET statement_timeout = 30000').catch(err => {
     console.error('Error setting statement timeout:', err);
