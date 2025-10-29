@@ -47,8 +47,10 @@ router.get('/candidate', protect, async (req, res) => {
     `, [req.user.id]);
 
     // Get profile completion percentage
+    // NOTE: candidate profiles use 'professional_title' in other parts of the app
+    // keep the dashboard in sync by selecting professional_title here.
     const profileResult = await pool.query(`
-      SELECT title, bio, location, phone, linkedin_url, skills
+      SELECT professional_title, bio, location, phone, linkedin_url, skills
       FROM candidates
       WHERE user_id = $1
     `, [req.user.id]);
@@ -56,7 +58,8 @@ router.get('/candidate', protect, async (req, res) => {
     let profileCompletion = 20; // Base for having account
     if (profileResult.rows.length > 0) {
       const profile = profileResult.rows[0];
-      if (profile.title) profileCompletion += 15;
+      // Use professional_title (keeps parity with profile edit page)
+      if (profile.professional_title) profileCompletion += 15;
       if (profile.bio) profileCompletion += 15;
       if (profile.location) profileCompletion += 15;
       if (profile.phone) profileCompletion += 10;

@@ -3,7 +3,7 @@ import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import multer from 'multer';
-import { uploadProfilePicture, getProfilePictureSignedUrl } from '../utils/supabaseStorage.js';
+import { uploadProfilePicture, getProfilePictureSignedUrl, uploadToBucket, createSignedUrl, BUCKET_NAME, FOLDERS } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
@@ -33,7 +33,7 @@ router.get('/profile', protect, async (req, res, next) => {
     }
 
     const result = await pool.query(
-      `SELECT c.*, u.name, u.email
+      `SELECT c.*, u.email
        FROM candidates c
        JOIN users u ON c.user_id = u.id
        WHERE c.user_id = $1`,
@@ -49,17 +49,15 @@ router.get('/profile', protect, async (req, res, next) => {
         [req.user.id]
       );
 
-      const userResult = await pool.query(
-        'SELECT name, email FROM users WHERE id = $1',
-        [req.user.id]
-      );
+      // Use candidate.full_name if present later; for newly created profile fall back to user fields
+      const fallbackName = req.user.username || req.user.email || 'candidate';
 
       return res.json({
         success: true,
         profile: {
           ...createResult.rows[0],
-          name: userResult.rows[0].name,
-          email: userResult.rows[0].email,
+          name: fallbackName,
+          email: req.user.email,
           experiences: []
         }
       });
@@ -255,7 +253,7 @@ router.put('/profile', protect, async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT c.*, u.name
+      `SELECT c.*, u.username as username, u.email
        FROM candidates c
        JOIN users u ON c.user_id = u.id
        WHERE c.id = $1 AND c.is_public = true`,
@@ -290,8 +288,11 @@ router.get('/:id', async (req, res, next) => {
       [req.params.id]
     );
 
+    // Prefer candidate.full_name, fallback to username
+    const row = result.rows[0];
     const profile = {
-      ...result.rows[0],
+      ...row,
+      name: row.full_name || row.username || null,
       experiences: employmentResult.rows,
       educations: educationResult.rows
     };
@@ -340,6 +341,63 @@ router.post('/profile/avatar', protect, upload.single('avatar'), async (req, res
       success: true,
       message: 'Profile picture uploaded successfully',
       avatar_path: path
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Configure multer for resume uploads (memory)
+const resumeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new AppError('Invalid resume file type. Allowed: PDF, DOC, DOCX, TXT', 400), false);
+  }
+});
+
+// @route   POST /api/candidates/profile/resume
+// @desc    Upload candidate resume and save path on profile
+// @access  Private (Candidate only)
+router.post('/profile/resume', protect, resumeUpload.single('resume'), async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    if (!req.file) {
+      return next(new AppError('No file uploaded', 400));
+    }
+
+    const userId = req.user.id;
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+    const ext = fileName.split('.').pop().toLowerCase();
+    const path = `${FOLDERS.RESUME}/${userId}-${Date.now()}.${ext}`;
+
+    const { data, error } = await uploadToBucket(BUCKET_NAME, path, fileBuffer, {
+      contentType: req.file.mimetype,
+      upsert: true,
+    });
+
+    if (error) {
+      console.error('Supabase resume upload error:', error);
+      return next(new AppError('Failed to upload resume', 500));
+    }
+
+    // Update candidate profile with the resume path
+    await pool.query('UPDATE candidates SET resume_url = $1, updated_at = NOW() WHERE user_id = $2', [path, userId]);
+
+    // Create signed URL for immediate access
+    const signed = await createSignedUrl(BUCKET_NAME, path, 3600);
+
+    res.json({
+      success: true,
+      message: 'Resume uploaded successfully',
+      resume_path: path,
+      signedUrl: signed.data?.signedUrl || null
     });
   } catch (error) {
     next(error);

@@ -17,6 +17,8 @@ import consentRoutes from './routes/consent.routes.js';
 import searchRoutes from './routes/search.routes.js';
 import notificationRoutes from './routes/notification.routes.js';
 import dashboardRoutes from './routes/dashboard.routes.js';
+import publicRoutes from './routes/public.routes.js';
+import pool from './config/database.js';
 
 // Import middleware
 import { errorHandler } from './middleware/errorHandler.js';
@@ -62,6 +64,9 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Public Routes (before API routes)
+app.use('/', publicRoutes);
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/companies', companyRoutes);
@@ -90,6 +95,21 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
     logger.info(`🚀 VeriBoard API server running on port ${PORT}`);
     logger.info(`📝 Environment: ${process.env.NODE_ENV}`);
   });
+
+  // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
+  const cleanupOldNotifications = async () => {
+    try {
+      const res = await pool.query("DELETE FROM notifications WHERE created_at < NOW() - INTERVAL '7 days'");
+      logger.info(`🧹 Cleaned up ${res.rowCount} notifications older than 7 days`);
+    } catch (err) {
+      logger.error('Error cleaning up old notifications:', err);
+    }
+  };
+
+  // Run once immediately, then schedule daily cleanup
+  cleanupOldNotifications();
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  setInterval(cleanupOldNotifications, ONE_DAY_MS);
 }
 
 export default app;

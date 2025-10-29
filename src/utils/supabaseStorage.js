@@ -8,7 +8,11 @@ const BUCKET_NAME = 'VeriBoard_bucket';
 const FOLDERS = {
   PROFILE_PIC: 'profile_pic',
   RESUME: 'resume',
+  COMPANY_LOGO: 'company_logo',
 };
+
+// Export bucket constants as named exports so other modules can import them directly
+export { BUCKET_NAME, FOLDERS };
 
 /**
  * Upload a Buffer/Stream/File to Supabase Storage
@@ -56,21 +60,20 @@ export async function uploadProfilePicture(userId, fileBuffer, fileName, options
 }
 
 /**
- * Upload a resume to the resume folder
- * @param {string} userId - user identifier
- * @param {Buffer|Uint8Array} fileBuffer - resume file buffer
- * @param {string} fileName - original file name
+ * Upload a company logo to the company_logo folder
+ * @param {string} userId - user identifier (company user)
+ * @param {Buffer|Uint8Array} fileBuffer - image file buffer
+ * @param {string} fileName - original file name (for extension)
  * @param {object} options - optional: { upsert }
  * @returns {Promise<{error, data, path}>}
  */
-export async function uploadResume(userId, fileBuffer, fileName, options = {}) {
+export async function uploadCompanyLogo(userId, fileBuffer, fileName, options = {}) {
   const { upsert = true } = options;
   const ext = fileName.split('.').pop().toLowerCase();
-  const timestamp = Date.now();
-  const path = `${FOLDERS.RESUME}/${userId}_${timestamp}.${ext}`;
+  const path = `${FOLDERS.COMPANY_LOGO}/${userId}.${ext}`;
 
   const { data, error } = await uploadToBucket(BUCKET_NAME, path, fileBuffer, {
-    contentType: getContentTypeForResume(ext),
+    contentType: `image/${ext}`,
     upsert,
   });
 
@@ -121,6 +124,21 @@ export async function createSignedUrl(bucket, path, expiresInSeconds = 60) {
 }
 
 /**
+ * Delete an object from a bucket
+ * @param {string} bucket
+ * @param {string} path
+ */
+export async function deleteFromBucket(bucket, path) {
+  if (!bucket || !path) return { data: null, error: 'Missing bucket or path' };
+  try {
+    const res = await supabase.storage.from(bucket).remove([path]);
+    return res; // { data, error }
+  } catch (err) {
+    return { data: null, error: err };
+  }
+}
+
+/**
  * Get a signed URL for a profile picture
  * @param {string} path - the path of the file in storage
  * @param {number} expiresInSeconds - expiration time in seconds (default 3600 = 1 hour)
@@ -134,10 +152,11 @@ export async function getProfilePictureSignedUrl(path, expiresInSeconds = 3600) 
 export default {
   uploadToBucket,
   uploadProfilePicture,
-  uploadResume,
+  uploadCompanyLogo,
   getPublicUrl,
   createSignedUrl,
   getProfilePictureSignedUrl,
+  deleteFromBucket,
   BUCKET_NAME,
   FOLDERS,
 };
