@@ -3,9 +3,21 @@ import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
 // Load environment variables
 dotenv.config();
+// If a .env.local file exists, load it too (local overrides)
+try {
+  const localEnv = path.resolve(process.cwd(), '.env.local');
+  if (fs.existsSync(localEnv)) {
+    dotenv.config({ path: localEnv });
+    console.log('Loaded .env.local');
+  }
+} catch (err) {
+  console.warn('Could not load .env.local', err.message || err);
+}
 
 // Import routes
 import authRoutes from './routes/auth.routes.js';
@@ -78,6 +90,8 @@ app.use('/api/search', searchRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
+// Development-only debug routes removed
+
 // 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({ 
@@ -94,6 +108,7 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
     logger.info(`🚀 VeriBoard API server running on port ${PORT}`);
     logger.info(`📝 Environment: ${process.env.NODE_ENV}`);
+    logger.info(`🔐 ENABLE_OTP_ON_LOGIN=${process.env.ENABLE_OTP_ON_LOGIN || 'unset'}`);
   });
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.

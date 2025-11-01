@@ -19,9 +19,9 @@ export const protect = async (req, res, next) => {
       // Verify token
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-      // Get user from database (Supabase schema: no name or role in users table)
+      // Get user from database - include name from users table
       const result = await pool.query(
-        'SELECT id, email, account_type, is_verified FROM users WHERE id = $1',
+        'SELECT id, email, account_type, is_verified, name FROM users WHERE id = $1',
         [decoded.id]
       );
 
@@ -31,31 +31,28 @@ export const protect = async (req, res, next) => {
 
       const user = result.rows[0];
 
-      // Get name from company or candidate table
-      let name = user.email.split('@')[0]; // Default to email prefix
-      if (user.account_type === 'company') {
-        const companyResult = await pool.query(
-          'SELECT name FROM companies WHERE user_id = $1',
-          [user.id]
-        );
-        if (companyResult.rows.length > 0) {
-          name = companyResult.rows[0].name;
-        }
-      } else if (user.account_type === 'candidate') {
+      // Get display name - for candidates from candidates table, for companies from users table
+      let displayName = user.name || user.email.split('@')[0]; // Default to name from users table
+      
+      if (user.account_type === 'candidate') {
+        // For candidates, get full_name from candidates table
         const candidateResult = await pool.query(
           'SELECT full_name FROM candidates WHERE user_id = $1',
           [user.id]
         );
-        if (candidateResult.rows.length > 0) {
-          name = candidateResult.rows[0].full_name || user.email.split('@')[0];
+        if (candidateResult.rows.length > 0 && candidateResult.rows[0].full_name) {
+          displayName = candidateResult.rows[0].full_name;
         }
       }
+      // For companies, use name from users table (already set above)
+
+      // For companies, use name from users table (already set above)
 
       // Set user object with all needed fields (both camelCase and snake_case for compatibility)
       req.user = {
         id: user.id,
         email: user.email,
-        name: name,
+        name: displayName,
         accountType: user.account_type,
         account_type: user.account_type, // Keep snake_case for backward compatibility
         role: user.account_type, // Use account_type as role for authorization
