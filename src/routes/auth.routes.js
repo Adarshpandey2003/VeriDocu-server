@@ -477,8 +477,9 @@ router.post(
 
       // If OTP-on-login is enabled, send a one-time code and require verification
       const enableOtpOnLogin = process.env.ENABLE_OTP_ON_LOGIN === 'true';
+      console.log('🔐 OTP on login enabled:', enableOtpOnLogin); // Debug log
       if (enableOtpOnLogin) {
-    // OTP-on-login is enabled (no debug log)
+    // OTP-on-login is enabled
         const code = generateOtpCode();
         // Delete any existing OTPs for this email before creating a new one
         try {
