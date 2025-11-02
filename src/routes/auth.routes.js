@@ -243,7 +243,7 @@ const generateToken = (id) => {
 };
 
 // @route   POST /api/auth/register
-// @desc    Register a new user (sends OTP without creating account)
+// @desc    Register a new user and create account immediately
 // @access  Public
 router.post(
   '/register',
@@ -276,70 +276,46 @@ router.post(
         return next(new AppError('User already exists with this email', 409));
       }
 
-      // Hash password for storage
+      // Hash password
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      // Generate OTP code
-      const code = generateOtpCode();
+      // Create user account immediately
+      const pwColCreate = await detectPasswordColumn() || 'password_hash';
+      const createQuery = `INSERT INTO users (email, ${pwColCreate}, account_type, name, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, email, account_type, name`;
+      const userResult = await pool.query(createQuery, [email, hashedPassword, accountType, name]);
 
-      // Store registration data temporarily in otp_codes table as JSON
-      // We'll create the user only after OTP verification
-      const registrationData = JSON.stringify({
-        name,
-        email,
-        hashedPassword,
-        accountType,
-        companyName: companyName || null,
-      });
+      const user = userResult.rows[0];
 
-      // Delete existing pending registrations for this email
-      try {
-        await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'verify_email']);
-      } catch (delErr) {
-        console.warn('[OTP] Failed to delete existing otps for', email, delErr.message || delErr);
+      // If company account, create company profile
+      if (accountType === 'company') {
+        const slug = (companyName || name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+        await pool.query(
+          `INSERT INTO companies (name, slug, user_id, created_at) VALUES ($1, $2, $3, NOW())`,
+          [companyName || name, slug, user.id]
+        );
       }
 
-      // Store OTP code with registration data
-      // Use PostgreSQL NOW() + INTERVAL to avoid timezone issues
-      const hasMetadataCol = await detectColumn('otp_codes', ['metadata', 'data']);
-      if (hasMetadataCol) {
+      // If candidate account, create candidate profile
+      if (accountType === 'candidate') {
         await pool.query(
-          `INSERT INTO otp_codes (email, code, purpose, expires_at, ${hasMetadataCol}, created_at)
-           VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', $4, NOW())`,
-          [email, code, 'verify_email', registrationData]
+          `INSERT INTO candidates (user_id, full_name, created_at) VALUES ($1, $2, NOW())`,
+          [user.id, name]
         );
-      } else {
-        // Fallback: store in a temporary table or use email as key
-        await pool.query(
-          `INSERT INTO otp_codes (email, code, purpose, expires_at, created_at)
-           VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', NOW())`,
-          [email, code, 'verify_email']
-        );
-        // Store registration data in memory or temp table
-        // For simplicity, we'll pass it to verify-email via the frontend
       }
 
-      // Send verification email asynchronously (don't wait for it)
-      sendOtpEmail(email, code, 'register').catch(err => {
-        console.error('Failed to send OTP email:', err);
-      });
+      // Generate token
+      const token = generateToken(user.id);
 
-      // Respond immediately without waiting for email
-      res.status(200).json({
+      res.status(201).json({
         success: true,
-        message: 'Please check your email for verification code.',
-        requiresVerification: true,
-        email: email,
-        mailSent: true, // Assume it will be sent
-        // Send registration data back so frontend can pass it to verify-email
-        // This is safe because the OTP acts as verification
-        registrationData: {
-          name,
-          email,
-          accountType,
-          companyName,
-          hashedPassword, // Frontend will pass this back
+        message: 'Account created successfully!',
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          accountType: user.account_type,
+          name: user.name,
         },
       });
     } catch (error) {
