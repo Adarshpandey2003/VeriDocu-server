@@ -1,5 +1,10 @@
 import nodemailer from 'nodemailer';
 
+// Cache the transport to avoid creating new connections every time
+let cachedTransport = null;
+let lastTransportCheck = 0;
+const TRANSPORT_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 // Build candidate SMTP transport configs to try in order. This helps when
 // providers accept either 587 (STARTTLS) or 465 (SSL) and the environment
 // may not specify the correct secure/port combo.
@@ -16,28 +21,45 @@ function buildSmtpCandidates() {
 
   // If explicit port/secure provided, try that first
   if (configuredPort) {
-    candidates.push({ host, port: configuredPort, secure: !!configuredSecure, auth: { user, pass } });
+    candidates.push({ 
+      host, 
+      port: configuredPort, 
+      secure: !!configuredSecure, 
+      auth: { user, pass },
+      pool: true, // Use connection pooling for faster emails
+      maxConnections: 5,
+      maxMessages: 100
+    });
   }
 
   // Add common combos: 587 STARTTLS (secure=false) then 465 SSL (secure=true)
-  candidates.push({ host, port: 587, secure: false, auth: { user, pass } });
-  candidates.push({ host, port: 465, secure: true, auth: { user, pass } });
+  candidates.push({ 
+    host, 
+    port: 587, 
+    secure: false, 
+    auth: { user, pass },
+    pool: true,
+    maxConnections: 5,
+    maxMessages: 100
+  });
+  candidates.push({ 
+    host, 
+    port: 465, 
+    secure: true, 
+    auth: { user, pass },
+    pool: true,
+    maxConnections: 5,
+    maxMessages: 100
+  });
 
   return candidates;
 }
 
 async function createWorkingTransport() {
-  const postmarkKey = process.env.POSTMARK_API_KEY;
-  if (postmarkKey) {
-    // Postmark SMTP transport
-    const t = nodemailer.createTransport({ host: 'smtp.postmarkapp.com', port: 587, secure: false, auth: { user: postmarkKey, pass: postmarkKey } });
-    try {
-      await t.verify();
-      return t;
-    } catch (err) {
-      console.error('Postmark SMTP verify failed:', err && err.code, err && err.message);
-      // fallthrough to try generic SMTP
-    }
+  // Return cached transport if still valid
+  const now = Date.now();
+  if (cachedTransport && (now - lastTransportCheck) < TRANSPORT_CACHE_TTL) {
+    return cachedTransport;
   }
 
   const candidates = buildSmtpCandidates();
@@ -46,6 +68,8 @@ async function createWorkingTransport() {
     try {
       // verify() attempts to connect/auth — gives clearer error messages early
       await t.verify();
+      cachedTransport = t;
+      lastTransportCheck = now;
       return t;
     } catch (err) {
       console.warn('SMTP candidate failed to verify', { host: cfg.host, port: cfg.port, secure: cfg.secure, code: err && err.code });
@@ -53,18 +77,21 @@ async function createWorkingTransport() {
     }
   }
 
+  cachedTransport = null;
   return null;
 }
 
 export async function sendOtpEmail(toEmail, code, purpose = 'login') {
   const from = process.env.FROM_EMAIL || 'noreply@veriboard.com';
 
-  // If no SMTP/postmark configured at all, skip sending in dev but return skipped
-  if (!process.env.POSTMARK_API_KEY && !(process.env.SMTP_HOST && process.env.SMTP_USER)) {
+  // If no SMTP configured, skip sending in dev but return skipped
+  if (!(process.env.SMTP_HOST && process.env.SMTP_USER)) {
     console.warn('⚠️  EMAIL NOT CONFIGURED - No mail transport available');
     console.warn('   To fix this, add to your .env file:');
-    console.warn('   Option 1 (Gmail): SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_USER=your@gmail.com, SMTP_PASS=app-password');
-    console.warn('   Option 2 (Postmark): POSTMARK_API_KEY=your-server-token');
+    console.warn('   SMTP_HOST=smtp.gmail.com (or smtp.mail.yahoo.com)');
+    console.warn('   SMTP_PORT=587 (or 465 for SSL)');
+    console.warn('   SMTP_USER=your@email.com');
+    console.warn('   SMTP_PASS=your-app-password');
     console.warn(`   OTP code for ${toEmail}: ${code} (expires in 10 minutes)`);
     return { skipped: true };
   }
@@ -75,7 +102,6 @@ export async function sendOtpEmail(toEmail, code, purpose = 'login') {
     const err = new Error('No working SMTP transport could be created (verify failed)');
     console.error('❌ EMAIL TRANSPORT FAILED');
     console.error('   Check your email credentials in .env file');
-    console.error('   Postmark key:', process.env.POSTMARK_API_KEY ? 'present (may be invalid)' : 'not configured');
     console.error('   SMTP config:', process.env.SMTP_HOST ? `${process.env.SMTP_HOST}:${process.env.SMTP_PORT}` : 'not configured');
     console.error(`   OTP code for ${toEmail}: ${code} (use this to test)`);
     return { ok: false, error: err };

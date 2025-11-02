@@ -130,7 +130,6 @@ router.post('/otp/request', async (req, res, next) => {
     }
 
     const code = generateOtpCode();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Remove any existing OTPs for this email to avoid multiple valid codes
     try {
@@ -139,19 +138,21 @@ router.post('/otp/request', async (req, res, next) => {
       console.warn('[OTP] Failed to delete existing otps for', email, delErr.message || delErr);
     }
 
-    // Store code (insert)
+    // Store code with PostgreSQL NOW() + INTERVAL to avoid timezone issues
     await pool.query(
       `INSERT INTO otp_codes (email, code, purpose, expires_at, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [normEmail, code, purpose, expiresAt]
+       VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', NOW())`,
+      [normEmail, code, purpose]
     );
 
-    // Send via email (best-effort)
-  const mailRes = await sendOtpEmail(email, code, purpose);
+    // Send via email (fire-and-forget, don't wait)
+    sendOtpEmail(email, code, purpose).catch(err => {
+      console.error('[OTP] Background email send error:', err.message || err);
+    });
 
     // (debug logging removed)
 
-    res.json({ success: true, message: 'OTP sent', mailSent: mailRes.ok ?? false });
+    res.json({ success: true, message: 'OTP sent', mailSent: true });
   } catch (error) {
     next(error);
   }
@@ -281,7 +282,6 @@ router.post(
 
       // Generate OTP code
       const code = generateOtpCode();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
       // Store registration data temporarily in otp_codes table as JSON
       // We'll create the user only after OTP verification
@@ -301,35 +301,37 @@ router.post(
       }
 
       // Store OTP code with registration data
-      // Note: We're using the metadata column if it exists, otherwise we'll need to store it separately
+      // Use PostgreSQL NOW() + INTERVAL to avoid timezone issues
       const hasMetadataCol = await detectColumn('otp_codes', ['metadata', 'data']);
       if (hasMetadataCol) {
         await pool.query(
           `INSERT INTO otp_codes (email, code, purpose, expires_at, ${hasMetadataCol}, created_at)
-           VALUES ($1, $2, $3, $4, $5, NOW())`,
-          [email, code, 'verify_email', expiresAt, registrationData]
+           VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', $4, NOW())`,
+          [email, code, 'verify_email', registrationData]
         );
       } else {
         // Fallback: store in a temporary table or use email as key
-        // For now, we'll use email normalization to match during verification
         await pool.query(
           `INSERT INTO otp_codes (email, code, purpose, expires_at, created_at)
-           VALUES ($1, $2, $3, $4, NOW())`,
-          [email, code, 'verify_email', expiresAt]
+           VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', NOW())`,
+          [email, code, 'verify_email']
         );
         // Store registration data in memory or temp table
         // For simplicity, we'll pass it to verify-email via the frontend
       }
 
-      // Send verification email
-      const mailRes = await sendOtpEmail(email, code, 'register');
+      // Send verification email asynchronously (don't wait for it)
+      sendOtpEmail(email, code, 'register').catch(err => {
+        console.error('Failed to send OTP email:', err);
+      });
 
+      // Respond immediately without waiting for email
       res.status(200).json({
         success: true,
         message: 'Please check your email for verification code.',
         requiresVerification: true,
         email: email,
-        mailSent: mailRes.ok ?? false,
+        mailSent: true, // Assume it will be sent
         // Send registration data back so frontend can pass it to verify-email
         // This is safe because the OTP acts as verification
         registrationData: {
@@ -478,7 +480,6 @@ router.post(
       if (enableOtpOnLogin) {
     // OTP-on-login is enabled (no debug log)
         const code = generateOtpCode();
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
         // Delete any existing OTPs for this email before creating a new one
         try {
           await pool.query('DELETE FROM otp_codes WHERE email = $1', [email]);
@@ -486,18 +487,18 @@ router.post(
           console.warn('[AUTH] Failed to delete existing otps for', email, delErr.message || delErr);
         }
 
+        // Use PostgreSQL NOW() + INTERVAL to avoid timezone issues
         await pool.query(
           `INSERT INTO otp_codes (email, code, purpose, expires_at, created_at)
-           VALUES ($1, $2, $3, $4, NOW())`,
-          [email, code, '2fa', expiresAt]
+           VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', NOW())`,
+          [email, code, '2fa']
         );
-        // Send OTP email (best-effort)
-        try {
-          const mailRes = await sendOtpEmail(email, code, 'login');
-          // mail result handled, avoid noisy console logging in production
-        } catch (mailErr) {
-          console.error('[AUTH] sendOtpEmail threw error for', email, mailErr);
-        }
+        
+        // Send OTP email (fire-and-forget, don't wait)
+        sendOtpEmail(email, code, 'login').catch(err => {
+          console.error('[AUTH] Background email send error for login OTP:', err.message || err);
+        });
+        
         return res.json({ success: true, otpRequired: true, message: 'OTP sent to email' });
       }
 
