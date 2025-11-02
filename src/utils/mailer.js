@@ -107,7 +107,9 @@ export async function sendOtpEmail(toEmail, code, purpose = 'login') {
     return { ok: false, error: err };
   }
 
-  const subject = purpose === 'register' ? 'Your VeriBoard signup code' : 'Your VeriBoard login code';
+  const subject = purpose === 'register' ? 'Your VeriBoard signup code' : 
+                  purpose === 'reset-password' ? 'Reset your VeriBoard password' :
+                  'Your VeriBoard login code';
   const text = `Your VeriBoard ${purpose} code is: ${code}\n\nThis code will expire in 10 minutes.`;
   const html = `<p>Your VeriBoard <strong>${purpose}</strong> code is:</p><h2>${code}</h2><p>This code will expire in 10 minutes.</p>`;
 

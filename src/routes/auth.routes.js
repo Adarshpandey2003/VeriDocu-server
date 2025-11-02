@@ -568,4 +568,113 @@ router.post('/logout', async (req, res, next) => {
   }
 });
 
+// @route   POST /api/auth/forgot-password
+// @desc    Send OTP code to email for password reset
+// @access  Public
+router.post('/forgot-password', [
+  body('email').isEmail().withMessage('Valid email is required')
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { email } = req.body;
+
+    // Check if user exists
+    const userResult = await pool.query('SELECT id, email FROM users WHERE email = $1', [email]);
+    
+    if (userResult.rows.length === 0) {
+      // Don't reveal if user exists or not for security
+      return res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
+    }
+
+    // Generate OTP code
+    const code = generateOtpCode();
+    
+    // Delete any existing reset codes for this email
+    try {
+      await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'reset-password']);
+    } catch (delErr) {
+      console.warn('[AUTH] Failed to delete existing reset codes for', email, delErr.message || delErr);
+    }
+
+    // Store OTP with reset-password purpose
+    await pool.query(
+      `INSERT INTO otp_codes (email, code, purpose, expires_at, created_at)
+       VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', NOW())`,
+      [email, code, 'reset-password']
+    );
+
+    // Send reset code via email (fire-and-forget)
+    sendOtpEmail(email, code, 'reset-password').catch(err => {
+      console.error('[AUTH] Background email send error for reset password:', err.message || err);
+    });
+
+    res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/auth/reset-password
+// @desc    Reset password using OTP code
+// @access  Public
+router.post('/reset-password', [
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('code').notEmpty().withMessage('OTP code is required'),
+  body('newPassword').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { email, code, newPassword } = req.body;
+
+    // Verify OTP code
+    const otpResult = await pool.query(
+      `SELECT * FROM otp_codes WHERE email = $1 AND code = $2 AND purpose = $3 AND expires_at > NOW()`,
+      [email, code, 'reset-password']
+    );
+
+    if (otpResult.rows.length === 0) {
+      return next(new AppError('Invalid or expired reset code', 400));
+    }
+
+    // Find user
+    const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    
+    if (userResult.rows.length === 0) {
+      return next(new AppError('User not found', 404));
+    }
+
+    const user = userResult.rows[0];
+
+    // Hash new password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    // Update password (detect which column to use)
+    const pwCol = await detectPasswordColumn();
+    if (!pwCol) {
+      return next(new AppError('Server misconfiguration: no password column found', 500));
+    }
+
+    await pool.query(
+      `UPDATE users SET ${pwCol} = $1 WHERE id = $2`,
+      [hashedPassword, user.id]
+    );
+
+    // Delete used OTP code
+    await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'reset-password']);
+
+    res.json({ success: true, message: 'Password reset successfully' });
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
