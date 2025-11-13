@@ -6,6 +6,9 @@ import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { protect } from '../middleware/auth.js';
 import { sendOtpEmail } from '../utils/mailer.js';
+
+console.log('🔥🔥🔥 AUTH ROUTES MODULE LOADED 🔥🔥🔥');
+
 // Use global fetch (Node 18+) to call Google reCAPTCHA verify endpoint. If your Node runtime
 // does not include global fetch, install node-fetch and import it here.
 
@@ -145,14 +148,42 @@ router.post('/otp/request', async (req, res, next) => {
       [normEmail, code, purpose]
     );
 
-    // Send via email (fire-and-forget, don't wait)
-    sendOtpEmail(email, code, purpose).catch(err => {
-      console.error('[OTP] Background email send error:', err.message || err);
+    console.log(`[OTP] ═══════════════════════════════════════════════════════`);
+    console.log(`[OTP] 📧 Recipient: ${email}`);
+    console.log(`[OTP] 🔐 Code: ${code}`);
+    console.log(`[OTP] 📝 Purpose: ${purpose}`);
+    console.log(`[OTP] ⏰ Expires: 10 minutes`);
+    console.log(`[OTP] ═══════════════════════════════════════════════════════`);
+
+    // Send via email (await to catch errors immediately)
+    let emailSent = false;
+    try {
+      const emailResult = await sendOtpEmail(email, code, purpose);
+      if (emailResult.ok) {
+        console.log(`[OTP] ✅ Email sent successfully! Message ID: ${emailResult.messageId}`);
+        emailSent = true;
+      } else if (emailResult.skipped) {
+        console.warn(`[OTP] ⚠️  Email sending skipped (SendGrid not configured)`);
+      } else {
+        console.error(`[OTP] ❌ Failed to send email to ${email}`);
+        if (emailResult.error) {
+          console.error(`[OTP]    Error: ${emailResult.error.message || emailResult.error}`);
+        }
+      }
+    } catch (err) {
+      console.error('[OTP] ❌ Error sending email:', err.message || err);
+      if (err.response) {
+        console.error('[OTP] SendGrid response:', JSON.stringify(err.response.body, null, 2));
+      }
+    }
+
+    // Always return success so users can still use the app during testing/development
+    // The OTP code is logged above and stored in database for verification
+    res.json({ 
+      success: true, 
+      message: emailSent ? 'OTP sent to your email' : 'OTP generated (check server console in development)', 
+      mailSent: emailSent 
     });
-
-    // (debug logging removed)
-
-    res.json({ success: true, message: 'OTP sent', mailSent: true });
   } catch (error) {
     next(error);
   }
@@ -191,27 +222,17 @@ router.post('/otp/verify', async (req, res, next) => {
     let user = userResult.rows[0];
     if (purpose === 'register') {
       if (user) return next(new AppError('User already exists', 409));
-      // Insert user using whichever password column exists
-      const pwCol = await detectPasswordColumn();
-      const pwInsertCol = pwCol || 'password_hash';
-      const insertQuery = `INSERT INTO users (email, ${pwInsertCol}, account_type, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id, email, account_type`;
-      const insert = await pool.query(insertQuery, [email, null, accountType]);
+      // Insert user (users table has 'password' column and 'name' column)
+      const insertQuery = `INSERT INTO users (email, password, account_type, name, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, email, account_type, name`;
+      const insert = await pool.query(insertQuery, [email, null, accountType, name || null]);
       user = insert.rows[0];
 
       // Create candidate/company profile as appropriate
       if (accountType === 'candidate') {
-        // detect candidate name column
-        const candNameCol = (await detectColumn('candidates', ['full_name', 'name', 'first_name'])) || 'full_name';
-        if (candNameCol === 'first_name') {
-          // If only first_name exists, insert into first_name and leave last_name null
-          await pool.query(`INSERT INTO candidates (user_id, first_name, created_at) VALUES ($1, $2, NOW())`, [user.id, name || null]);
-        } else {
-          await pool.query(`INSERT INTO candidates (user_id, ${candNameCol}, created_at) VALUES ($1, $2, NOW())`, [user.id, name || null]);
-        }
+        await pool.query(`INSERT INTO candidates (user_id, created_at) VALUES ($1, NOW())`, [user.id]);
       } else if (accountType === 'company') {
         const slug = (name || email.split('@')[0]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-        const compNameCol = (await detectColumn('companies', ['name', 'company_name'])) || 'name';
-        await pool.query(`INSERT INTO companies (user_id, ${compNameCol}, slug, created_at) VALUES ($1, $2, $3, NOW())`, [user.id, name || email.split('@')[0], slug]);
+        await pool.query(`INSERT INTO companies (user_id, slug, created_at) VALUES ($1, $2, NOW())`, [user.id, slug]);
       }
     } else {
       // login flow: require existing user
@@ -280,43 +301,52 @@ router.post(
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      // Create user account immediately
-      const pwColCreate = await detectPasswordColumn() || 'password_hash';
-      const createQuery = `INSERT INTO users (email, ${pwColCreate}, account_type, name, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, email, account_type, name`;
-      const userResult = await pool.query(createQuery, [email, hashedPassword, accountType, name]);
-
-      const user = userResult.rows[0];
-
-      // If company account, create company profile
-      if (accountType === 'company') {
-        const slug = (companyName || name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-        await pool.query(
-          `INSERT INTO companies (name, slug, user_id, created_at) VALUES ($1, $2, $3, NOW())`,
-          [companyName || name, slug, user.id]
-        );
+      // Generate OTP for email verification
+      const code = generateOtpCode();
+      
+      // Delete any existing OTP codes for this email
+      try {
+        await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'register']);
+      } catch (delErr) {
+        console.warn('[AUTH] Failed to delete existing OTP codes for', email, delErr.message || delErr);
       }
 
-      // If candidate account, create candidate profile
-      if (accountType === 'candidate') {
-        await pool.query(
-          `INSERT INTO candidates (user_id, full_name, created_at) VALUES ($1, $2, NOW())`,
-          [user.id, name]
-        );
+      // Store OTP with register purpose
+      await pool.query(
+        `INSERT INTO otp_codes (email, code, purpose, expires_at, created_at)
+         VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes', NOW())`,
+        [email, code, 'register']
+      );
+
+      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+      console.log(`[AUTH] 📧 Registration OTP for: ${email}`);
+      console.log(`[AUTH] 🔐 Verification Code: ${code}`);
+      console.log(`[AUTH] ⏰ Expires in: 10 minutes`);
+      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+
+      // Send verification email
+      try {
+        const emailResult = await sendOtpEmail(email, code, 'register');
+        if (emailResult.ok) {
+          console.log(`[AUTH] ✅ Registration email sent successfully! Message ID: ${emailResult.messageId}`);
+        } else if (emailResult.skipped) {
+          console.warn(`[AUTH] ⚠️  Email sending skipped (Resend not configured)`);
+        } else {
+          console.error(`[AUTH] ❌ Failed to send registration email to ${email}`);
+          if (emailResult.error) {
+            console.error(`[AUTH]    Error: ${emailResult.error.message || emailResult.error}`);
+          }
+        }
+      } catch (err) {
+        console.error('[AUTH] ❌ Error sending registration OTP:', err.message || err);
       }
 
-      // Generate token
-      const token = generateToken(user.id);
-
+      // Return success with OTP requirement
       res.status(201).json({
         success: true,
-        message: 'Account created successfully!',
-        token,
-        user: {
-          id: user.id,
-          email: user.email,
-          accountType: user.account_type,
-          name: user.name,
-        },
+        message: 'Verification code sent to your email. Please verify to complete registration.',
+        requiresVerification: true,
+        email: email,
       });
     } catch (error) {
       next(error);
@@ -341,7 +371,7 @@ router.post('/verify-email', async (req, res, next) => {
     // Check if code is valid - NO NORMALIZATION
     const result = await pool.query(
       `SELECT * FROM otp_codes WHERE email = $1 AND code = $2 AND purpose = $3 AND expires_at > NOW()`,
-      [email, code, 'verify_email']
+      [email, code, 'register']
     );
 
     if (result.rows.length === 0) {
@@ -349,7 +379,7 @@ router.post('/verify-email', async (req, res, next) => {
     }
 
     // Delete used code
-    await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'verify_email']);
+    await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'register']);
 
     // Check if user already exists (edge case: created between register and verify)
     const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
@@ -457,6 +487,13 @@ router.post(
       if (enableOtpOnLogin) {
     // OTP-on-login is enabled
         const code = generateOtpCode();
+        
+        console.log(`\n[AUTH] ═══════════════════════════════════════════════════════`);
+        console.log(`[AUTH] 📧 Generating NEW login OTP for: ${email}`);
+        console.log(`[AUTH] 🔐 Code: ${code}`);
+        console.log(`[AUTH] ⏰ Expires in: 10 minutes`);
+        console.log(`[AUTH] ═══════════════════════════════════════════════════════\n`);
+        
         // Delete any existing OTPs for this email before creating a new one
         try {
           await pool.query('DELETE FROM otp_codes WHERE email = $1', [email]);
@@ -519,6 +556,111 @@ router.post(
   }
 );
 
+// @route   POST /api/auth/verify-login-otp
+// @desc    Verify OTP code sent during login
+// @access  Public
+router.post(
+  '/verify-login-otp',
+  [
+    body('email').isEmail().withMessage('Valid email is required'),
+    body('code').notEmpty().withMessage('Verification code is required'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { email, code } = req.body;
+
+      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+      console.log(`[AUTH] 🔐 Verifying login OTP for: ${email}`);
+      console.log(`[AUTH] 📝 Code: ${code}`);
+      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+
+      // First, let's check what OTP codes exist for this email
+      const debugResult = await pool.query(
+        `SELECT code, purpose, expires_at, expires_at > NOW() as is_valid FROM otp_codes WHERE email = $1`,
+        [email]
+      );
+      console.log(`[AUTH] 🔍 Found ${debugResult.rows.length} OTP code(s) in database for ${email}:`);
+      debugResult.rows.forEach((row, idx) => {
+        console.log(`[AUTH]   ${idx + 1}. Code: ${row.code}, Purpose: ${row.purpose}, Valid: ${row.is_valid}, Expires: ${row.expires_at}`);
+      });
+
+      // Check if code is valid
+      const result = await pool.query(
+        `SELECT * FROM otp_codes WHERE email = $1 AND code = $2 AND purpose = $3 AND expires_at > NOW()`,
+        [email, code, '2fa']
+      );
+
+      if (result.rows.length === 0) {
+        console.log(`[AUTH] ❌ Invalid or expired OTP code for ${email}`);
+        return next(new AppError('Invalid or expired verification code', 400));
+      }
+
+      // Delete used code
+      await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, '2fa']);
+
+      console.log(`[AUTH] ✅ OTP verified successfully for ${email}`);
+
+      // Get user information
+      const pwCol = await detectPasswordColumn();
+      if (!pwCol) return next(new AppError('Server misconfiguration: no password column found', 500));
+
+      const userResult = await pool.query(
+        `SELECT id, email, account_type, name FROM users WHERE email = $1`,
+        [email]
+      );
+
+      if (userResult.rows.length === 0) {
+        return next(new AppError('User not found', 404));
+      }
+
+      const user = userResult.rows[0];
+
+      // Get name - for candidates from candidates table, for companies from users table
+      let displayName = user.name || email.split('@')[0];
+      
+      if (user.account_type === 'candidate') {
+        const candNameCol = await detectColumn('candidates', ['full_name', 'name', 'first_name']);
+        if (candNameCol === 'full_name' || candNameCol === 'name') {
+          const candidateResult = await pool.query(`SELECT ${candNameCol} as candidate_name FROM candidates WHERE user_id = $1`, [user.id]);
+          if (candidateResult.rows.length > 0 && candidateResult.rows[0].candidate_name) {
+            displayName = candidateResult.rows[0].candidate_name;
+          }
+        } else if (candNameCol === 'first_name') {
+          const candidateResult = await pool.query(`SELECT first_name, last_name FROM candidates WHERE user_id = $1`, [user.id]);
+          if (candidateResult.rows.length > 0) {
+            const r = candidateResult.rows[0];
+            displayName = [r.first_name, r.last_name].filter(Boolean).join(' ') || displayName;
+          }
+        }
+      }
+
+      // Generate token
+      const token = generateToken(user.id);
+
+      console.log(`[AUTH] ✅ Token generated successfully for ${email}`);
+
+      res.json({
+        success: true,
+        message: 'Login successful!',
+        token,
+        user: {
+          id: user.id,
+          name: displayName,
+          email: user.email,
+          accountType: user.account_type,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 // @route   GET /api/auth/me
 // @desc    Get current user
 // @access  Private
@@ -552,21 +694,33 @@ router.post('/forgot-password', [
   body('email').isEmail().withMessage('Valid email is required')
 ], async (req, res, next) => {
   try {
+    console.log('\n[AUTH] ═══════════════════════════════════════════════════════');
+    console.log('[AUTH] 🔄 FORGOT PASSWORD REQUEST RECEIVED');
+    console.log('[AUTH] Request body:', JSON.stringify(req.body, null, 2));
+    console.log('[AUTH] ═══════════════════════════════════════════════════════\n');
+    
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      console.log('[AUTH] ❌ Validation errors:', errors.array());
       return res.status(400).json({ success: false, errors: errors.array() });
     }
 
     const { email } = req.body;
+    console.log(`[AUTH] Processing forgot password for: ${email}`);
 
     // Check if user exists
     const userResult = await pool.query('SELECT id, email FROM users WHERE email = $1', [email]);
     
+    console.log(`[AUTH] User lookup result: Found ${userResult.rows.length} user(s)`);
+    
     if (userResult.rows.length === 0) {
+      console.log(`[AUTH] ⚠️  User not found for email: ${email} (returning success for security)`);
       // Don't reveal if user exists or not for security
       return res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
     }
 
+    console.log(`[AUTH] ✓ User found, generating OTP code...`);
+    
     // Generate OTP code
     const code = generateOtpCode();
     
@@ -584,10 +738,33 @@ router.post('/forgot-password', [
       [email, code, 'reset-password']
     );
 
-    // Send reset code via email (fire-and-forget)
-    sendOtpEmail(email, code, 'reset-password').catch(err => {
-      console.error('[AUTH] Background email send error for reset password:', err.message || err);
-    });
+    console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+    console.log(`[AUTH] 📧 Password Reset Request for: ${email}`);
+    console.log(`[AUTH] 🔐 Reset Code: ${code}`);
+    console.log(`[AUTH] ⏰ Expires in: 10 minutes`);
+    console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+
+    // Send reset code via email (await to catch errors immediately)
+    let emailSent = false;
+    try {
+      const emailResult = await sendOtpEmail(email, code, 'reset-password');
+      if (emailResult.ok) {
+        console.log(`[AUTH] ✅ Email sent successfully! Message ID: ${emailResult.messageId}`);
+        emailSent = true;
+      } else if (emailResult.skipped) {
+        console.warn(`[AUTH] ⚠️  Email sending skipped (SendGrid not configured)`);
+      } else {
+        console.error(`[AUTH] ❌ Failed to send email to ${email}`);
+        if (emailResult.error) {
+          console.error(`[AUTH]    Error: ${emailResult.error.message || emailResult.error}`);
+        }
+      }
+    } catch (err) {
+      console.error('[AUTH] ❌ Error sending password reset OTP:', err.message || err);
+      if (err.response) {
+        console.error('[AUTH] SendGrid response:', err.response.body);
+      }
+    }
 
     res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
   } catch (error) {
