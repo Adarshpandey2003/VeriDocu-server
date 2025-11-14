@@ -253,7 +253,7 @@ router.put('/profile', protect, async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT c.*, u.username as username, u.email
+      `SELECT c.*, u.name as username, u.email
        FROM candidates c
        JOIN users u ON c.user_id = u.id
        WHERE c.id = $1 AND c.is_public = true`,

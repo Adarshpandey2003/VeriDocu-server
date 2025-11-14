@@ -30,6 +30,9 @@ import searchRoutes from './routes/search.routes.js';
 import notificationRoutes from './routes/notification.routes.js';
 import dashboardRoutes from './routes/dashboard.routes.js';
 import publicRoutes from './routes/public.routes.js';
+import adminRoutes from './routes/admin.routes.js';
+import candidateVerificationRoutes from './routes/candidate-verification.routes.js';
+import companyVerificationRoutes from './routes/company-verification.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -59,6 +62,9 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Compression
 app.use(compression());
 
+// Serve static files for uploads
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
 // Request logging (only in development)
 if (process.env.NODE_ENV === 'development') {
   app.use((req, res, next) => {
@@ -84,7 +90,9 @@ app.use('/', publicRoutes);
 
 // API Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/companies', companyVerificationRoutes);
 app.use('/api/companies', companyRoutes);
+app.use('/api/candidates', candidateVerificationRoutes);
 app.use('/api/candidates', candidateRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/verifications', verificationRoutes);
@@ -92,6 +100,7 @@ app.use('/api/consent', consentRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Development-only debug routes removed
 

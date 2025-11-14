@@ -1,0 +1,469 @@
+import express from 'express';
+import pool from '../config/database.js';
+import { protect, authorize } from '../middleware/auth.js';
+import { AppError } from '../middleware/errorHandler.js';
+
+const router = express.Router();
+
+// Protect all admin routes
+router.use(protect);
+router.use(authorize('admin'));
+
+// @route   GET /api/admin/verifications/stats
+// @desc    Get verification statistics (employment + companies)
+// @access  Admin only
+router.get('/verifications/stats', async (req, res, next) => {
+  try {
+    const { status, verificationType } = req.query;
+
+    // Get employment verification stats
+    const employmentStatsQuery = `
+      SELECT 
+        COUNT(*) as total_requests,
+        COUNT(CASE WHEN verification_type = 'manual' THEN 1 END) as total_manual,
+        COUNT(CASE WHEN verification_status = 'pending' THEN 1 END) as pending,
+        COUNT(CASE WHEN verification_status = 'pending' AND verification_type = 'manual' THEN 1 END) as pending_manual,
+        COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as approved,
+        COUNT(CASE WHEN verification_status = 'verified' AND verification_type = 'manual' THEN 1 END) as approved_manual,
+        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END) as rejected,
+        COUNT(CASE WHEN verification_status = 'rejected' AND verification_type = 'manual' THEN 1 END) as rejected_manual
+      FROM employment_history
+    `;
+
+    // Get company verification stats
+    const companyStatsQuery = `
+      SELECT 
+        COUNT(*) as total_companies,
+        COUNT(CASE WHEN verification_status = 'pending' OR verification_status IS NULL THEN 1 END) as pending_companies,
+        COUNT(CASE WHEN verification_status = 'verified' OR is_verified = true THEN 1 END) as approved_companies,
+        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END) as rejected_companies
+      FROM companies
+    `;
+
+    const [employmentStats, companyStats] = await Promise.all([
+      pool.query(employmentStatsQuery),
+      pool.query(companyStatsQuery)
+    ]);
+
+    const empStats = employmentStats.rows[0];
+    const compStats = companyStats.rows[0];
+
+    const stats = {
+      totalRequests: parseInt(empStats.total_requests) + parseInt(compStats.total_companies),
+      totalManual: parseInt(empStats.total_manual),
+      totalCompanies: parseInt(compStats.total_companies),
+      pending: parseInt(empStats.pending) + parseInt(compStats.pending_companies),
+      pendingCompanies: parseInt(compStats.pending_companies),
+      pendingManual: parseInt(empStats.pending_manual),
+      approved: parseInt(empStats.approved) + parseInt(compStats.approved_companies),
+      approvedCompanies: parseInt(compStats.approved_companies),
+      approvedManual: parseInt(empStats.approved_manual),
+      rejected: parseInt(empStats.rejected) + parseInt(compStats.rejected_companies),
+      rejectedCompanies: parseInt(compStats.rejected_companies),
+      rejectedManual: parseInt(empStats.rejected_manual),
+    };
+
+    // Get employment verification list with filters
+    let whereConditions = [];
+    let queryParams = [];
+    let paramIndex = 1;
+
+    if (status && status !== 'all') {
+      whereConditions.push(`eh.verification_status = $${paramIndex}`);
+      queryParams.push(status);
+      paramIndex++;
+    }
+
+    if (verificationType === 'manual') {
+      whereConditions.push(`eh.verification_type = 'manual'`);
+    }
+
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    const verificationsQuery = `
+      SELECT 
+        eh.id,
+        eh.company_name,
+        eh.position,
+        eh.verification_status,
+        eh.verification_type,
+        eh.start_date,
+        eh.end_date,
+        eh.is_current,
+        eh.created_at,
+        u.name as candidate_name,
+        u.email as candidate_email
+      FROM employment_history eh
+      JOIN candidates c ON eh.candidate_id = c.id
+      JOIN users u ON c.user_id = u.id
+      ${whereClause}
+      ORDER BY eh.created_at DESC
+      LIMIT 100
+    `;
+
+    const verificationsResult = await pool.query(verificationsQuery, queryParams);
+
+    res.json({
+      success: true,
+      stats,
+      verifications: verificationsResult.rows.map(row => ({
+        id: row.id,
+        entityName: `${row.candidate_name} - ${row.position} at ${row.company_name}`,
+        entityType: 'employment',
+        requestedBy: row.candidate_email,
+        submittedAt: row.created_at,
+        verificationType: row.verification_type || 'auto',
+        status: row.verification_status || 'pending',
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/employments
+// @desc    Get all employment verifications with filters
+// @access  Admin only
+router.get('/employments', async (req, res, next) => {
+  try {
+    const { status, verificationType } = req.query;
+
+    // Build stats query
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN verification_status = 'pending' OR verification_status IS NULL THEN 1 END) as pending,
+        COUNT(CASE WHEN verification_status = 'pending' AND verification_type = 'manual' THEN 1 END) as pending_manual,
+        COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as verified,
+        COUNT(CASE WHEN verification_status = 'verified' AND verification_type = 'manual' THEN 1 END) as verified_manual,
+        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END) as rejected,
+        COUNT(CASE WHEN verification_status = 'rejected' AND verification_type = 'manual' THEN 1 END) as rejected_manual
+      FROM employment_history
+    `;
+
+    const statsResult = await pool.query(statsQuery);
+    const stats = {
+      total: parseInt(statsResult.rows[0].total),
+      pending: parseInt(statsResult.rows[0].pending),
+      pendingManual: parseInt(statsResult.rows[0].pending_manual),
+      verified: parseInt(statsResult.rows[0].verified),
+      verifiedManual: parseInt(statsResult.rows[0].verified_manual),
+      rejected: parseInt(statsResult.rows[0].rejected),
+      rejectedManual: parseInt(statsResult.rows[0].rejected_manual),
+    };
+
+    // Get employment list with filters
+    let whereConditions = [];
+    let queryParams = [];
+    let paramIndex = 1;
+
+    if (status && status !== 'all') {
+      if (status === 'pending') {
+        whereConditions.push(`(eh.verification_status = 'pending' OR eh.verification_status IS NULL)`);
+      } else {
+        whereConditions.push(`eh.verification_status = $${paramIndex}`);
+        queryParams.push(status);
+        paramIndex++;
+      }
+    }
+
+    if (verificationType === 'manual') {
+      whereConditions.push(`eh.verification_type = 'manual'`);
+    }
+
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    const employmentsQuery = `
+      SELECT 
+        eh.id,
+        eh.company_name,
+        eh.position,
+        eh.start_date,
+        eh.end_date,
+        eh.is_current,
+        eh.verification_status,
+        eh.verification_type,
+        eh.created_at,
+        u.name as candidate_name,
+        u.email as candidate_email
+      FROM employment_history eh
+      JOIN candidates c ON eh.candidate_id = c.id
+      JOIN users u ON c.user_id = u.id
+      ${whereClause}
+      ORDER BY eh.created_at DESC
+    `;
+
+    const employmentsResult = await pool.query(employmentsQuery, queryParams);
+
+    res.json({
+      success: true,
+      stats,
+      employments: employmentsResult.rows.map(row => ({
+        id: row.id,
+        candidateName: row.candidate_name,
+        candidateEmail: row.candidate_email,
+        companyName: row.company_name,
+        position: row.position,
+        startDate: row.start_date,
+        endDate: row.end_date,
+        isCurrent: row.is_current,
+        verificationStatus: row.verification_status || 'pending',
+        verificationType: row.verification_type || 'auto',
+        createdAt: row.created_at,
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/admin/employments/:id/verify
+// @desc    Verify an employment record
+// @access  Admin only
+router.post('/employments/:id/verify', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    const result = await pool.query(
+      `UPDATE employment_history 
+       SET verification_status = 'verified', 
+           verified_by = $1,
+           verified_at = NOW(),
+           notes = $2,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [req.user.id, notes, id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Employment record not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Employment verified successfully',
+      employment: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/admin/employments/:id/reject
+// @desc    Reject an employment record
+// @access  Admin only
+router.post('/employments/:id/reject', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const result = await pool.query(
+      `UPDATE employment_history 
+       SET verification_status = 'rejected',
+           rejection_reason = $1,
+           verified_by = $2,
+           verified_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [reason, req.user.id, id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Employment record not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Employment rejected',
+      employment: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/companies
+// @desc    Get all companies with filters
+// @access  Admin only
+router.get('/companies', async (req, res, next) => {
+  try {
+    const { status } = req.query;
+
+    // Build stats query
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN verification_status = 'pending' OR verification_status IS NULL THEN 1 END) as pending,
+        COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as verified,
+        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END) as rejected
+      FROM users u
+      WHERE account_type = 'company'
+    `;
+
+    const statsResult = await pool.query(statsQuery);
+    const stats = {
+      total: parseInt(statsResult.rows[0].total),
+      pending: parseInt(statsResult.rows[0].pending),
+      verified: parseInt(statsResult.rows[0].verified),
+      rejected: parseInt(statsResult.rows[0].rejected),
+    };
+
+    // Get companies list with filters
+    let whereConditions = ['u.account_type = $1'];
+    let queryParams = ['company'];
+    let paramIndex = 2;
+
+    if (status && status !== 'all') {
+      if (status === 'pending') {
+        whereConditions.push(`(u.verification_status = 'pending' OR u.verification_status IS NULL)`);
+      } else {
+        whereConditions.push(`u.verification_status = $${paramIndex}`);
+        queryParams.push(status);
+        paramIndex++;
+      }
+    }
+
+    const whereClause = `WHERE ${whereConditions.join(' AND ')}`;
+
+    const companiesQuery = `
+      SELECT 
+        u.id,
+        u.email,
+        u.name,
+        u.verification_status,
+        u.created_at,
+        c.name as company_name,
+        c.industry,
+        c.company_size,
+        c.website
+      FROM users u
+      LEFT JOIN companies c ON u.id = c.user_id
+      ${whereClause}
+      ORDER BY u.created_at DESC
+    `;
+
+    const companiesResult = await pool.query(companiesQuery, queryParams);
+
+    res.json({
+      success: true,
+      stats,
+      companies: companiesResult.rows.map(row => ({
+        id: row.id,
+        email: row.email,
+        name: row.company_name || row.name,
+        verificationStatus: row.verification_status || 'pending',
+        industry: row.industry,
+        companySize: row.company_size,
+        website: row.website,
+        createdAt: row.created_at,
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/admin/companies/:id/verify
+// @desc    Verify a company
+// @access  Admin only
+router.post('/companies/:id/verify', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    const result = await pool.query(
+      `UPDATE users 
+       SET verification_status = 'verified', 
+           is_verified = true,
+           updated_at = NOW()
+       WHERE id = $1 AND account_type = 'company'
+       RETURNING id, email, name`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Company not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Company verified successfully',
+      company: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/admin/companies/:id/reject
+// @desc    Reject a company
+// @access  Admin only
+router.post('/companies/:id/reject', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const result = await pool.query(
+      `UPDATE users 
+       SET verification_status = 'rejected',
+           updated_at = NOW()
+       WHERE id = $1 AND account_type = 'company'
+       RETURNING id, email, name`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Company not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Company rejected',
+      company: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   PUT /api/admin/users/:id/status
+// @desc    Update user verification status
+// @access  Admin only
+router.put('/users/:id/status', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ['pending', 'verified', 'rejected'];
+    if (!validStatuses.includes(status)) {
+      return next(new AppError('Invalid status', 400));
+    }
+
+    const result = await pool.query(
+      `UPDATE users 
+       SET verification_status = $1,
+           is_verified = $2,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, email, name, account_type, verification_status`,
+      [status, status === 'verified', id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('User not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'User status updated successfully',
+      user: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;
