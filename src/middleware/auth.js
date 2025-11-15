@@ -9,9 +9,12 @@ export const protect = async (req, res, next) => {
     // Get token from header
     if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
       token = req.headers.authorization.split(' ')[1];
+      console.log(`[AUTH] ✅ Token found in authorization header for ${req.method} ${req.path}`);
     }
 
     if (!token) {
+      console.log(`[AUTH] ❌ No token found for ${req.method} ${req.path}`);
+      console.log(`[AUTH] Headers:`, req.headers.authorization ? 'Authorization header exists but invalid format' : 'No authorization header');
       return next(new AppError('Not authorized to access this route', 401));
     }
 
@@ -71,6 +74,11 @@ export const protect = async (req, res, next) => {
 
 export const authorize = (...accountTypes) => {
   return (req, res, next) => {
+    // Check if user exists (protect middleware should have set this)
+    if (!req.user) {
+      return next(new AppError('Authentication required. Please log in.', 401));
+    }
+
     // Check against account_type (candidate, company, admin)
     if (!accountTypes.includes(req.user.accountType) && !accountTypes.includes(req.user.role)) {
       return next(

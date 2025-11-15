@@ -305,6 +305,7 @@ router.post(
       const requireOtpOnRegister = process.env.REQUIRE_OTP_ON_REGISTER === 'true';
 
       if (!requireOtpOnRegister) {
+
         // Create user immediately without OTP verification
         const pwColCreate = await detectPasswordColumn() || 'password_hash';
         const createQuery = `INSERT INTO users (email, ${pwColCreate}, account_type, name, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, email, account_type, name`;
@@ -384,6 +385,8 @@ router.post(
       }
 
       // Return success with OTP requirement and registration data
+      console.log(`[AUTH] ✅ Registration OTP sent, requiresVerification=true`);
+      
       res.status(201).json({
         success: true,
         message: 'Verification code sent to your email. Please verify to complete registration.',

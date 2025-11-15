@@ -33,7 +33,10 @@ router.get('/profile', protect, async (req, res, next) => {
     }
 
     let result = await pool.query(
-      `SELECT c.*, u.email 
+      `SELECT c.*, u.email,
+              c.verification_status as "hrVerificationStatus",
+              c.hr_document_url as "hrDocumentUrl",
+              c.rejection_reason as "hrRejectionReason"
        FROM companies c
        JOIN users u ON c.user_id = u.id
        WHERE c.user_id = $1`,
@@ -53,7 +56,10 @@ router.get('/profile', protect, async (req, res, next) => {
       
       // Fetch the newly created profile
       result = await pool.query(
-        `SELECT c.*, u.email 
+        `SELECT c.*, u.email,
+                c.verification_status as "hrVerificationStatus",
+                c.hr_document_url as "hrDocumentUrl",
+                c.rejection_reason as "hrRejectionReason"
          FROM companies c
          JOIN users u ON c.user_id = u.id
          WHERE c.user_id = $1`,
@@ -194,6 +200,7 @@ router.get('/:slug', async (req, res, next) => {
   try {
     const result = await pool.query(
       `SELECT c.*, 
+              c.verification_status as "verificationStatus",
               (SELECT COUNT(*) FROM jobs WHERE company_id = c.id AND is_active = true) as active_jobs
        FROM companies c
        WHERE c.slug = $1`,
@@ -346,6 +353,250 @@ router.get('/profile/logo-url', protect, async (req, res, next) => {
     res.json({
       success: true,
       signedUrl: data.signedUrl
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ====== BRANCH MANAGEMENT ROUTES ======
+
+// @route   GET /api/companies/profile/branches
+// @desc    Get all branches for current company
+// @access  Private (Company only)
+router.get('/profile/branches', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'company') {
+      return next(new AppError('Access denied. Companies only.', 403));
+    }
+
+    // Get company ID
+    const companyResult = await pool.query(
+      'SELECT id FROM companies WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return next(new AppError('Company profile not found', 404));
+    }
+
+    const companyId = companyResult.rows[0].id;
+
+    // Get all branches
+    const branchesResult = await pool.query(
+      `SELECT * FROM company_branches 
+       WHERE company_id = $1 
+       ORDER BY is_headquarters DESC, created_at ASC`,
+      [companyId]
+    );
+
+    res.json({
+      success: true,
+      branches: branchesResult.rows
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/companies/profile/branches
+// @desc    Add a new branch for current company
+// @access  Private (Company only)
+router.post('/profile/branches', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'company') {
+      return next(new AppError('Access denied. Companies only.', 403));
+    }
+
+    const { name, address, city, state, country, postal_code, phone, email, is_headquarters } = req.body;
+
+    if (!name || !address || !city || !country) {
+      return next(new AppError('Name, address, city, and country are required', 400));
+    }
+
+    // Get company ID
+    const companyResult = await pool.query(
+      'SELECT id FROM companies WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return next(new AppError('Company profile not found', 404));
+    }
+
+    const companyId = companyResult.rows[0].id;
+
+    // If this is being set as headquarters, unset other headquarters
+    if (is_headquarters) {
+      await pool.query(
+        'UPDATE company_branches SET is_headquarters = FALSE WHERE company_id = $1',
+        [companyId]
+      );
+    }
+
+    // Insert new branch
+    const result = await pool.query(
+      `INSERT INTO company_branches 
+       (company_id, name, address, city, state, country, postal_code, phone, email, is_headquarters, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+       RETURNING *`,
+      [companyId, name, address, city, state, country, postal_code, phone, email, is_headquarters || false]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Branch added successfully',
+      branch: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   PUT /api/companies/profile/branches/:id
+// @desc    Update a branch
+// @access  Private (Company only)
+router.put('/profile/branches/:id', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'company') {
+      return next(new AppError('Access denied. Companies only.', 403));
+    }
+
+    const { id } = req.params;
+    const { name, address, city, state, country, postal_code, phone, email, is_headquarters, is_active } = req.body;
+
+    // Get company ID
+    const companyResult = await pool.query(
+      'SELECT id FROM companies WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return next(new AppError('Company profile not found', 404));
+    }
+
+    const companyId = companyResult.rows[0].id;
+
+    // Verify branch belongs to this company
+    const branchCheck = await pool.query(
+      'SELECT id FROM company_branches WHERE id = $1 AND company_id = $2',
+      [id, companyId]
+    );
+
+    if (branchCheck.rows.length === 0) {
+      return next(new AppError('Branch not found', 404));
+    }
+
+    // If setting as headquarters, unset other headquarters
+    if (is_headquarters) {
+      await pool.query(
+        'UPDATE company_branches SET is_headquarters = FALSE WHERE company_id = $1 AND id != $2',
+        [companyId, id]
+      );
+    }
+
+    // Update branch
+    const result = await pool.query(
+      `UPDATE company_branches 
+       SET name = COALESCE($1, name),
+           address = COALESCE($2, address),
+           city = COALESCE($3, city),
+           state = COALESCE($4, state),
+           country = COALESCE($5, country),
+           postal_code = COALESCE($6, postal_code),
+           phone = COALESCE($7, phone),
+           email = COALESCE($8, email),
+           is_headquarters = COALESCE($9, is_headquarters),
+           is_active = COALESCE($10, is_active),
+           updated_at = NOW()
+       WHERE id = $11
+       RETURNING *`,
+      [name, address, city, state, country, postal_code, phone, email, is_headquarters, is_active, id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Branch updated successfully',
+      branch: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   DELETE /api/companies/profile/branches/:id
+// @desc    Delete a branch
+// @access  Private (Company only)
+router.delete('/profile/branches/:id', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'company') {
+      return next(new AppError('Access denied. Companies only.', 403));
+    }
+
+    const { id } = req.params;
+
+    // Get company ID
+    const companyResult = await pool.query(
+      'SELECT id FROM companies WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return next(new AppError('Company profile not found', 404));
+    }
+
+    const companyId = companyResult.rows[0].id;
+
+    // Delete branch (verify it belongs to this company)
+    const result = await pool.query(
+      'DELETE FROM company_branches WHERE id = $1 AND company_id = $2 RETURNING *',
+      [id, companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Branch not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Branch deleted successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/companies/:slug/branches
+// @desc    Get all branches for a company (public)
+// @access  Public
+router.get('/:slug/branches', async (req, res, next) => {
+  try {
+    const { slug } = req.params;
+
+    // Get company ID by slug
+    const companyResult = await pool.query(
+      'SELECT id FROM companies WHERE slug = $1',
+      [slug]
+    );
+
+    if (companyResult.rows.length === 0) {
+      return next(new AppError('Company not found', 404));
+    }
+
+    const companyId = companyResult.rows[0].id;
+
+    // Get active branches only for public view
+    const branchesResult = await pool.query(
+      `SELECT id, name, address, city, state, country, postal_code, phone, email, is_headquarters
+       FROM company_branches 
+       WHERE company_id = $1 AND is_active = TRUE
+       ORDER BY is_headquarters DESC, created_at ASC`,
+      [companyId]
+    );
+
+    res.json({
+      success: true,
+      branches: branchesResult.rows
     });
   } catch (error) {
     next(error);

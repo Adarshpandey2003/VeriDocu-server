@@ -25,8 +25,23 @@ async function runMigration() {
   try {
     console.log('🔄 Starting migration...\n');
 
+    // Add company_id column first
+    console.log('Adding company_id to employment_history table...');
+    
+    await client.query(`
+      ALTER TABLE employment_history 
+      ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL
+    `);
+    
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_employment_history_company 
+      ON employment_history(company_id)
+    `);
+    
+    console.log('✅ company_id column added\n');
+
     // Add columns to employment_history
-    console.log('Adding columns to employment_history table...');
+    console.log('Adding other columns to employment_history table...');
     
     await client.query(`
       ALTER TABLE employment_history 

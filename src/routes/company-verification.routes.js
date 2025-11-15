@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../config/database.js';
-import { authorize } from '../middleware/auth.js';
+import { protect, authorize } from '../middleware/auth.js';
 import multer from 'multer';
 import { supabase } from '../config/supabase.js';
 import path from 'path';
@@ -27,7 +27,7 @@ const upload = multer({
 });
 
 // Upload HR verification document
-router.post('/hr-verification', authorize('company'), upload.single('document'), async (req, res) => {
+router.post('/hr-verification', protect, authorize('company'), upload.single('document'), async (req, res) => {
   const client = await pool.connect();
   
   try {
@@ -38,18 +38,18 @@ router.post('/hr-verification', authorize('company'), upload.single('document'),
       return res.status(400).json({ message: 'Document is required' });
     }
 
-    // Get company ID from user
+    // Get company ID from companies table
     const companyResult = await client.query(
-      'SELECT company_id FROM users WHERE id = $1',
+      'SELECT id FROM companies WHERE user_id = $1',
       [req.user.id]
     );
 
-    if (!companyResult.rows[0]?.company_id) {
+    if (!companyResult.rows[0]?.id) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Company not found' });
     }
 
-    const companyId = companyResult.rows[0].company_id;
+    const companyId = companyResult.rows[0].id;
 
     // Upload to Supabase Storage
     const fileExt = path.extname(req.file.originalname);
@@ -79,7 +79,7 @@ router.post('/hr-verification', authorize('company'), upload.single('document'),
       UPDATE companies
       SET 
         hr_document_url = $1,
-        hr_verification_status = 'pending',
+        verification_status = 'pending',
         updated_at = NOW()
       WHERE id = $2
     `, [publicUrl, companyId]);
@@ -100,33 +100,37 @@ router.post('/hr-verification', authorize('company'), upload.single('document'),
 });
 
 // Get verification requests for the company
-router.get('/verification-requests', authorize('company'), async (req, res) => {
+router.get('/verification-requests', protect, authorize('company'), async (req, res) => {
   try {
-    // Get company ID
+    // Get company ID from companies table
     const companyResult = await pool.query(
-      'SELECT company_id FROM users WHERE id = $1',
+      'SELECT id FROM companies WHERE user_id = $1',
       [req.user.id]
     );
 
-    if (!companyResult.rows[0]?.company_id) {
+    if (!companyResult.rows[0]?.id) {
       return res.status(404).json({ message: 'Company not found' });
     }
 
-    const companyId = companyResult.rows[0].company_id;
+    const companyId = companyResult.rows[0].id;
 
-    // Check if HR is verified
+    // Check if HR is verified (for info only, don't block access)
     const hrStatusResult = await pool.query(
-      'SELECT hr_verification_status FROM companies WHERE id = $1',
+      'SELECT verification_status FROM companies WHERE id = $1',
       [companyId]
     );
 
-    if (hrStatusResult.rows[0]?.hr_verification_status !== 'verified') {
-      return res.status(403).json({ 
-        message: 'Your HR account must be verified before you can access verification requests' 
-      });
-    }
+    const hrVerified = hrStatusResult.rows[0]?.verification_status === 'verified';
 
     const { status } = req.query;
+
+    // Get company name to match against employment records
+    const companyNameResult = await pool.query(
+      'SELECT name FROM companies WHERE id = $1',
+      [companyId]
+    );
+
+    const companyName = companyNameResult.rows[0]?.name;
 
     let query = `
       SELECT 
@@ -141,39 +145,70 @@ router.get('/verification-requests', authorize('company'), async (req, res) => {
         eh.rejection_reason,
         eh.created_at,
         u.name as "candidateName",
-        u.email as "candidateEmail"
+        u.email as "candidateEmail",
+        c.user_id as candidate_user_id
       FROM employment_history eh
-      JOIN users u ON eh.candidate_id = u.id
-      WHERE eh.company_id = $1
+      JOIN candidates c ON eh.candidate_id = c.id
+      JOIN users u ON c.user_id = u.id
+      WHERE (eh.company_id = $1 OR LOWER(eh.company_name) = LOWER($2))
     `;
 
-    const params = [companyId];
+    const params = [companyId, companyName];
+    let paramIndex = 3;
 
     if (status && status !== 'all') {
-      query += ` AND eh.verification_status = $2`;
+      query += ` AND eh.verification_status = $${paramIndex}`;
       params.push(status);
+      paramIndex++;
     }
 
     query += ` ORDER BY eh.created_at DESC`;
 
     const result = await pool.query(query, params);
 
-    const requests = result.rows.map(row => ({
-      id: row.id,
-      candidateName: row.candidateName,
-      candidateEmail: row.candidateEmail,
-      position: row.position,
-      startDate: row.start_date,
-      endDate: row.end_date,
-      isCurrent: row.is_current,
-      location: row.location,
-      verificationStatus: row.verification_status,
-      documentUrl: row.document_url,
-      rejectionReason: row.rejection_reason,
-      createdAt: row.created_at
+    const requests = await Promise.all(result.rows.map(async row => {
+      let documentUrl = row.document_url;
+      
+      // Generate signed URL if document exists
+      if (documentUrl) {
+        try {
+          const urlParts = documentUrl.split('/VeriBoard_bucket/');
+          if (urlParts.length >= 2) {
+            const filePath = urlParts[1];
+            const { data, error } = await supabase.storage
+              .from('VeriBoard_bucket')
+              .createSignedUrl(filePath, 3600);
+            
+            if (!error && data?.signedUrl) {
+              documentUrl = data.signedUrl;
+            }
+          }
+        } catch (err) {
+          console.error('Error generating signed URL:', err);
+        }
+      }
+
+      return {
+        id: row.id,
+        candidateName: row.candidateName,
+        candidateEmail: row.candidateEmail,
+        position: row.position,
+        startDate: row.start_date,
+        endDate: row.end_date,
+        isCurrent: row.is_current,
+        location: row.location,
+        verificationStatus: row.verification_status,
+        documentUrl,
+        rejectionReason: row.rejection_reason,
+        createdAt: row.created_at
+      };
     }));
 
-    res.json({ requests });
+    res.json({ 
+      requests,
+      hrVerified,
+      warning: hrVerified ? null : 'Your HR account is not verified. Please complete HR verification to approve/reject requests.'
+    });
   } catch (error) {
     console.error('Error fetching verification requests:', error);
     res.status(500).json({ message: 'Failed to fetch verification requests' });
@@ -181,7 +216,7 @@ router.get('/verification-requests', authorize('company'), async (req, res) => {
 });
 
 // Approve verification request
-router.post('/verification-requests/:id/approve', authorize('company'), async (req, res) => {
+router.post('/verification-requests/:id/approve', protect, authorize('company'), async (req, res) => {
   const client = await pool.connect();
   
   try {
@@ -190,28 +225,35 @@ router.post('/verification-requests/:id/approve', authorize('company'), async (r
     const { id } = req.params;
     const { notes } = req.body;
 
-    // Get company ID
+    // Get company ID from companies table
     const companyResult = await client.query(
-      'SELECT company_id FROM users WHERE id = $1',
+      'SELECT id FROM companies WHERE user_id = $1',
       [req.user.id]
     );
 
-    if (!companyResult.rows[0]?.company_id) {
+    if (!companyResult.rows[0]?.id) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Company not found' });
     }
 
-    const companyId = companyResult.rows[0].company_id;
+    const companyId = companyResult.rows[0].id;
 
-    // Verify the employment belongs to this company
+    // Get company name for matching
+    const companyNameResult = await client.query(
+      'SELECT name FROM companies WHERE id = $1',
+      [companyId]
+    );
+    const companyName = companyNameResult.rows[0]?.name;
+
+    // Verify the employment belongs to this company (by ID or name)
     const employmentCheck = await client.query(
-      'SELECT id FROM employment_history WHERE id = $1 AND company_id = $2',
-      [id, companyId]
+      'SELECT id FROM employment_history WHERE id = $1 AND (company_id = $2 OR LOWER(company_name) = LOWER($3))',
+      [id, companyId, companyName]
     );
 
     if (employmentCheck.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Employment record not found' });
+      return res.status(404).json({ message: 'Employment record not found or does not belong to your company' });
     }
 
     // Update verification status
@@ -239,7 +281,7 @@ router.post('/verification-requests/:id/approve', authorize('company'), async (r
 });
 
 // Reject verification request
-router.post('/verification-requests/:id/reject', authorize('company'), async (req, res) => {
+router.post('/verification-requests/:id/reject', protect, authorize('company'), async (req, res) => {
   const client = await pool.connect();
   
   try {
@@ -253,28 +295,35 @@ router.post('/verification-requests/:id/reject', authorize('company'), async (re
       return res.status(400).json({ message: 'Rejection reason is required' });
     }
 
-    // Get company ID
+    // Get company ID from companies table
     const companyResult = await client.query(
-      'SELECT company_id FROM users WHERE id = $1',
+      'SELECT id FROM companies WHERE user_id = $1',
       [req.user.id]
     );
 
-    if (!companyResult.rows[0]?.company_id) {
+    if (!companyResult.rows[0]?.id) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Company not found' });
     }
 
-    const companyId = companyResult.rows[0].company_id;
+    const companyId = companyResult.rows[0].id;
 
-    // Verify the employment belongs to this company
+    // Get company name for matching
+    const companyNameResult = await client.query(
+      'SELECT name FROM companies WHERE id = $1',
+      [companyId]
+    );
+    const companyName = companyNameResult.rows[0]?.name;
+
+    // Verify the employment belongs to this company (by ID or name)
     const employmentCheck = await client.query(
-      'SELECT id FROM employment_history WHERE id = $1 AND company_id = $2',
-      [id, companyId]
+      'SELECT id FROM employment_history WHERE id = $1 AND (company_id = $2 OR LOWER(company_name) = LOWER($3))',
+      [id, companyId, companyName]
     );
 
     if (employmentCheck.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Employment record not found' });
+      return res.status(404).json({ message: 'Employment record not found or does not belong to your company' });
     }
 
     // Update verification status

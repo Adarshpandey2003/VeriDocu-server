@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../config/database.js';
-import { authorize } from '../middleware/auth.js';
+import { protect, authorize } from '../middleware/auth.js';
 import multer from 'multer';
 import { supabase } from '../config/supabase.js';
 import path from 'path';
@@ -27,8 +27,25 @@ const upload = multer({
 });
 
 // Get candidate's employment history with verification status
-router.get('/employment-history', authorize('candidate'), async (req, res) => {
+router.get('/employment-history', protect, authorize('candidate'), async (req, res) => {
   try {
+    // First get the candidate ID from user ID
+    let candidateResult = await pool.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    // Auto-create candidate profile if it doesn't exist
+    if (candidateResult.rows.length === 0) {
+      const createResult = await pool.query(
+        'INSERT INTO candidates (user_id, created_at, updated_at) VALUES ($1, NOW(), NOW()) RETURNING id',
+        [req.user.id]
+      );
+      candidateResult = createResult;
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
     const result = await pool.query(`
       SELECT 
         eh.id,
@@ -46,12 +63,12 @@ router.get('/employment-history', authorize('candidate'), async (req, res) => {
         eh.notes,
         eh.verified_at,
         eh.created_at,
-        COALESCE(c.name, '') as company_name
+        COALESCE(c.name, eh.company_name) as company_name
       FROM employment_history eh
       LEFT JOIN companies c ON eh.company_id = c.id
       WHERE eh.candidate_id = $1
       ORDER BY eh.start_date DESC
-    `, [req.user.id]);
+    `, [candidateId]);
 
     const employments = result.rows.map(row => ({
       id: row.id,
@@ -79,7 +96,7 @@ router.get('/employment-history', authorize('candidate'), async (req, res) => {
 });
 
 // Search companies
-router.get('/search-companies', authorize('candidate'), async (req, res) => {
+router.get('/search-companies', protect, authorize('candidate'), async (req, res) => {
   try {
     const { q } = req.query;
 
@@ -112,8 +129,145 @@ router.get('/search-companies', authorize('candidate'), async (req, res) => {
   }
 });
 
+// Update employment with verification document
+router.post('/employment-verification/update', protect, authorize('candidate'), upload.single('document'), async (req, res) => {
+  try {
+    const { employmentId, verificationType, companyId } = req.body;
+
+    if (!employmentId) {
+      return res.status(400).json({ message: 'Employment ID is required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'Verification document is required' });
+    }
+
+    // Get candidate_id from user_id
+    const candidateResult = await pool.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (candidateResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Candidate profile not found' });
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
+    // Verify the employment belongs to this candidate
+    const employmentCheck = await pool.query(
+      'SELECT id FROM employment_history WHERE id = $1 AND candidate_id = $2',
+      [employmentId, candidateId]
+    );
+
+    if (employmentCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Employment record not found or access denied' });
+    }
+
+    // Upload to Supabase Storage
+    const fileExt = path.extname(req.file.originalname);
+    const fileName = `candidate-${candidateId}-${Date.now()}${fileExt}`;
+    const filePath = `verification_docs/employment-verifications/${fileName}`;
+
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false
+      });
+
+    if (uploadError) {
+      console.error('Supabase upload error:', uploadError);
+      return res.status(500).json({ message: 'Failed to upload document' });
+    }
+
+    // Get public URL
+    const { data: { publicUrl } } = supabase.storage
+      .from('VeriBoard_bucket')
+      .getPublicUrl(filePath);
+
+    // Determine verification status based on type
+    const verificationStatus = verificationType === 'manual' ? 'pending' : 'in_review';
+
+    // Update employment record
+    const updateResult = await pool.query(`
+      UPDATE employment_history 
+      SET 
+        company_id = $1,
+        document_url = $2,
+        verification_status = $3,
+        verification_type = $4,
+        updated_at = NOW()
+      WHERE id = $5 AND candidate_id = $6
+      RETURNING *
+    `, [companyId || null, publicUrl, verificationStatus, verificationType || 'auto', employmentId, candidateId]);
+
+    res.json({
+      message: 'Verification document uploaded successfully',
+      employment: updateResult.rows[0]
+    });
+  } catch (error) {
+    console.error('Error updating employment verification:', error);
+    res.status(500).json({ message: 'Failed to upload verification document' });
+  }
+});
+
+// Get signed URL for employment document
+router.get('/employment-document/:employmentId', protect, authorize('candidate'), async (req, res) => {
+  try {
+    const { employmentId } = req.params;
+
+    // Get candidate_id from user_id
+    const candidateResult = await pool.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (candidateResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Candidate profile not found' });
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
+    // Get employment document URL
+    const employmentResult = await pool.query(
+      'SELECT document_url FROM employment_history WHERE id = $1 AND candidate_id = $2',
+      [employmentId, candidateId]
+    );
+
+    if (employmentResult.rows.length === 0 || !employmentResult.rows[0].document_url) {
+      return res.status(404).json({ message: 'Document not found' });
+    }
+
+    const documentUrl = employmentResult.rows[0].document_url;
+
+    // Extract file path from public URL
+    // Format: https://xxx.supabase.co/storage/v1/object/public/VeriBoard_bucket/path/to/file.pdf
+    const urlParts = documentUrl.split('/VeriBoard_bucket/');
+    if (urlParts.length < 2) {
+      return res.status(400).json({ message: 'Invalid document URL format' });
+    }
+    const filePath = urlParts[1];
+
+    // Generate signed URL (valid for 1 hour)
+    const { data, error } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .createSignedUrl(filePath, 3600);
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return res.status(500).json({ message: 'Failed to generate document access URL' });
+    }
+
+    res.json({ url: data.signedUrl });
+  } catch (error) {
+    console.error('Error getting employment document:', error);
+    res.status(500).json({ message: 'Failed to retrieve document' });
+  }
+});
+
 // Add employment with verification request
-router.post('/employment-verification', authorize('candidate'), upload.single('document'), async (req, res) => {
+router.post('/employment-verification', protect, authorize('candidate'), upload.single('document'), async (req, res) => {
   const client = await pool.connect();
   
   try {
@@ -158,6 +312,19 @@ router.post('/employment-verification', authorize('candidate'), upload.single('d
       .from('VeriBoard_bucket')
       .getPublicUrl(filePath);
 
+    // Get candidate ID from user ID
+    const candidateResult = await client.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (candidateResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Candidate profile not found' });
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
     // Insert employment record
     const insertResult = await client.query(`
       INSERT INTO employment_history (
@@ -177,7 +344,7 @@ router.post('/employment-verification', authorize('candidate'), upload.single('d
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
       RETURNING *
     `, [
-      req.user.id,
+      candidateId,
       companyId || null,
       companyName,
       position,

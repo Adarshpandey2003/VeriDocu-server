@@ -2,6 +2,7 @@ import express from 'express';
 import pool from '../config/database.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { supabase } from '../config/supabase.js';
 
 const router = express.Router();
 
@@ -198,20 +199,83 @@ router.get('/employments', async (req, res, next) => {
     res.json({
       success: true,
       stats,
-      employments: employmentsResult.rows.map(row => ({
-        id: row.id,
-        candidateName: row.candidate_name,
-        candidateEmail: row.candidate_email,
-        companyName: row.company_name,
-        position: row.position,
-        startDate: row.start_date,
-        endDate: row.end_date,
-        isCurrent: row.is_current,
-        verificationStatus: row.verification_status || 'pending',
-        verificationType: row.verification_type || 'auto',
-        createdAt: row.created_at,
+      employments: await Promise.all(employmentsResult.rows.map(async row => {
+        let documentUrl = row.document_url;
+        
+        // Generate signed URL if document exists
+        if (documentUrl) {
+          try {
+            const urlParts = documentUrl.split('/VeriBoard_bucket/');
+            if (urlParts.length >= 2) {
+              const filePath = urlParts[1];
+              const { data, error } = await supabase.storage
+                .from('VeriBoard_bucket')
+                .createSignedUrl(filePath, 3600);
+              
+              if (!error && data?.signedUrl) {
+                documentUrl = data.signedUrl;
+              }
+            }
+          } catch (err) {
+            console.error('Error generating signed URL for employment document:', err);
+          }
+        }
+
+        return {
+          id: row.id,
+          candidateName: row.candidate_name,
+          candidateEmail: row.candidate_email,
+          companyName: row.company_name,
+          position: row.position,
+          startDate: row.start_date,
+          endDate: row.end_date,
+          isCurrent: row.is_current,
+          verificationStatus: row.verification_status || 'pending',
+          verificationType: row.verification_type || 'auto',
+          createdAt: row.created_at,
+          documentUrl,
+        };
       })),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/employments/:id/document
+// @desc    Get employment verification document with signed URL
+// @access  Admin only
+router.get('/employments/:id/document', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      'SELECT document_url FROM employment_history WHERE id = $1',
+      [id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].document_url) {
+      return next(new AppError('Document not found', 404));
+    }
+
+    const documentUrl = result.rows[0].document_url;
+    const urlParts = documentUrl.split('/VeriBoard_bucket/');
+    
+    if (urlParts.length < 2) {
+      return next(new AppError('Invalid document URL format', 400));
+    }
+
+    const filePath = urlParts[1];
+    const { data, error } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .createSignedUrl(filePath, 3600);
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return next(new AppError('Failed to generate document access URL', 500));
+    }
+
+    res.json({ url: data.signedUrl });
   } catch (error) {
     next(error);
   }
@@ -292,15 +356,16 @@ router.get('/companies', async (req, res, next) => {
   try {
     const { status } = req.query;
 
-    // Build stats query
+    // Build stats query - use companies table for verification status
     const statsQuery = `
       SELECT 
         COUNT(*) as total,
-        COUNT(CASE WHEN verification_status = 'pending' OR verification_status IS NULL THEN 1 END) as pending,
-        COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as verified,
-        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END) as rejected
+        COUNT(CASE WHEN c.verification_status = 'pending' OR c.verification_status IS NULL THEN 1 END) as pending,
+        COUNT(CASE WHEN c.verification_status = 'verified' OR c.is_verified = true THEN 1 END) as verified,
+        COUNT(CASE WHEN c.verification_status = 'rejected' THEN 1 END) as rejected
       FROM users u
-      WHERE account_type = 'company'
+      LEFT JOIN companies c ON u.id = c.user_id
+      WHERE u.account_type = 'company'
     `;
 
     const statsResult = await pool.query(statsQuery);
@@ -318,9 +383,11 @@ router.get('/companies', async (req, res, next) => {
 
     if (status && status !== 'all') {
       if (status === 'pending') {
-        whereConditions.push(`(u.verification_status = 'pending' OR u.verification_status IS NULL)`);
+        whereConditions.push(`(c.verification_status = 'pending' OR c.verification_status IS NULL)`);
+      } else if (status === 'verified') {
+        whereConditions.push(`(c.verification_status = 'verified' OR c.is_verified = true)`);
       } else {
-        whereConditions.push(`u.verification_status = $${paramIndex}`);
+        whereConditions.push(`c.verification_status = $${paramIndex}`);
         queryParams.push(status);
         paramIndex++;
       }
@@ -333,11 +400,14 @@ router.get('/companies', async (req, res, next) => {
         u.id,
         u.email,
         u.name,
-        u.verification_status,
+        c.verification_status,
+        c.is_verified,
+        c.hr_verification_status,
+        c.hr_document_url,
         u.created_at,
         c.name as company_name,
         c.industry,
-        c.company_size,
+        c.size as company_size,
         c.website
       FROM users u
       LEFT JOIN companies c ON u.id = c.user_id
@@ -347,20 +417,89 @@ router.get('/companies', async (req, res, next) => {
 
     const companiesResult = await pool.query(companiesQuery, queryParams);
 
-    res.json({
-      success: true,
-      stats,
-      companies: companiesResult.rows.map(row => ({
+    // Generate signed URLs for HR documents
+    const companies = await Promise.all(companiesResult.rows.map(async row => {
+      let hrDocumentUrl = row.hr_document_url;
+      
+      if (hrDocumentUrl) {
+        try {
+          const urlParts = hrDocumentUrl.split('/VeriBoard_bucket/');
+          if (urlParts.length >= 2) {
+            const filePath = urlParts[1];
+            const { data, error } = await supabase.storage
+              .from('VeriBoard_bucket')
+              .createSignedUrl(filePath, 3600);
+            
+            if (!error && data?.signedUrl) {
+              hrDocumentUrl = data.signedUrl;
+            }
+          }
+        } catch (err) {
+          console.error('Error generating signed URL for HR document:', err);
+        }
+      }
+
+      return {
         id: row.id,
         email: row.email,
         name: row.company_name || row.name,
         verificationStatus: row.verification_status || 'pending',
+        hrVerificationStatus: row.hr_verification_status,
+        hrDocumentUrl,
         industry: row.industry,
         companySize: row.company_size,
         website: row.website,
         createdAt: row.created_at,
-      })),
+      };
+    }));
+
+    res.json({
+      success: true,
+      stats,
+      companies,
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/companies/:id/document
+// @desc    Get company HR verification document with signed URL
+// @access  Admin only
+router.get('/companies/:id/document', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT c.hr_document_url 
+       FROM companies c
+       JOIN users u ON c.user_id = u.id
+       WHERE u.id = $1 AND u.account_type = 'company'`,
+      [id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].hr_document_url) {
+      return next(new AppError('Document not found', 404));
+    }
+
+    const documentUrl = result.rows[0].hr_document_url;
+    const urlParts = documentUrl.split('/VeriBoard_bucket/');
+    
+    if (urlParts.length < 2) {
+      return next(new AppError('Invalid document URL format', 400));
+    }
+
+    const filePath = urlParts[1];
+    const { data, error } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .createSignedUrl(filePath, 3600);
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return next(new AppError('Failed to generate document access URL', 500));
+    }
+
+    res.json({ signedUrl: data.signedUrl });
   } catch (error) {
     next(error);
   }
@@ -374,19 +513,29 @@ router.post('/companies/:id/verify', async (req, res, next) => {
     const { id } = req.params;
     const { notes } = req.body;
 
+    // Update companies table, not users table
     const result = await pool.query(
-      `UPDATE users 
+      `UPDATE companies 
        SET verification_status = 'verified', 
            is_verified = true,
            updated_at = NOW()
-       WHERE id = $1 AND account_type = 'company'
-       RETURNING id, email, name`,
+       WHERE user_id = $1
+       RETURNING id, name`,
       [id]
     );
 
     if (result.rows.length === 0) {
       return next(new AppError('Company not found', 404));
     }
+
+    // Also update user's is_verified flag
+    await pool.query(
+      `UPDATE users 
+       SET is_verified = true,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [id]
+    );
 
     res.json({
       success: true,
@@ -406,13 +555,15 @@ router.post('/companies/:id/reject', async (req, res, next) => {
     const { id } = req.params;
     const { reason } = req.body;
 
+    // Update companies table, not users table
     const result = await pool.query(
-      `UPDATE users 
+      `UPDATE companies 
        SET verification_status = 'rejected',
+           rejection_reason = $2,
            updated_at = NOW()
-       WHERE id = $1 AND account_type = 'company'
-       RETURNING id, email, name`,
-      [id]
+       WHERE user_id = $1
+       RETURNING id, name`,
+      [id, reason]
     );
 
     if (result.rows.length === 0) {

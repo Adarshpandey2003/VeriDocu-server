@@ -98,7 +98,7 @@ router.get('/', async (req, res) => {
         j.created_at as "postedAt",
         c.name as company,
         c.logo_url as "companyLogo",
-        c.is_verified as "companyVerified",
+        c.verification_status as "companyVerificationStatus",
         c.id as "companyId",
         (SELECT COUNT(*) FROM job_applications WHERE job_id = j.id) as "applicationsCount"
     `;
@@ -171,7 +171,7 @@ router.get('/', async (req, res) => {
 
     // Top companies only (verified companies)
     if (topCompaniesOnly === 'true') {
-      query += ` AND c.is_verified = true`;
+      query += ` AND c.verification_status = 'verified'`;
     }
 
     // Sorting
@@ -207,11 +207,12 @@ router.get('/', async (req, res) => {
     `);
 
     const companiesResult = await pool.query(`
-      SELECT DISTINCT c.id, c.name, c.logo_url as "logoUrl", c.is_verified as "isVerified"
+      SELECT DISTINCT c.id, c.name, c.logo_url as "logoUrl", c.verification_status as "verificationStatus",
+        (c.verification_status = 'verified') as "isVerified"
       FROM companies c
       JOIN jobs j ON c.id = j.company_id
       WHERE j.is_active = true
-      ORDER BY c.is_verified DESC, c.name ASC
+      ORDER BY (c.verification_status = 'verified') DESC, c.name ASC
       LIMIT 50
     `);
 
@@ -638,7 +639,7 @@ router.get('/', async (req, res) => {
         j.*,
         c.name as company,
         c.logo_url as "companyLogo",
-        c.is_verified as "companyVerified",
+        c.verification_status as "companyVerificationStatus",
         c.slug,
         COALESCE(app_count.count, 0) as "applicationsCount",
         COALESCE(view_count.count, 0) as "viewsCount"
@@ -1157,7 +1158,7 @@ router.get('/:id', async (req, res) => {
         j.*,
         c.name as company,
         c.logo_url as "companyLogo",
-        c.is_verified as "companyVerified",
+        c.verification_status as "companyVerificationStatus",
         c.slug,
         c.description as "companyDescription",
         c.website as "companyWebsite",
