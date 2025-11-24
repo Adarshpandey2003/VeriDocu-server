@@ -104,18 +104,76 @@ router.get('/verifications/stats', async (req, res, next) => {
 
     const verificationsResult = await pool.query(verificationsQuery, queryParams);
 
+    // Get company verifications with filters
+    let companyWhereConditions = [];
+    let companyQueryParams = [];
+    let companyParamIndex = 1;
+
+    if (status && status !== 'all') {
+      companyWhereConditions.push(`c.verification_status = $${companyParamIndex}`);
+      companyQueryParams.push(status);
+      companyParamIndex++;
+    }
+
+    const companyWhereClause = companyWhereConditions.length > 0 ? `WHERE ${companyWhereConditions.join(' AND ')}` : '';
+
+    const companyVerificationsQuery = `
+      SELECT 
+        c.id,
+        c.name,
+        c.verification_status,
+        c.created_at,
+        u.name as admin_name,
+        u.email as admin_email
+      FROM companies c
+      LEFT JOIN users u ON c.user_id = u.id
+      ${companyWhereClause}
+      ORDER BY c.created_at DESC
+      LIMIT 100
+    `;
+
+    const companyVerificationsResult = await pool.query(companyVerificationsQuery, companyQueryParams);
+
+    // Combine employment and company verifications
+    const employmentVerifications = verificationsResult.rows.map(row => ({
+      id: row.id,
+      entityName: `${row.candidate_name} - ${row.position} at ${row.company_name}`,
+      entityType: 'employment',
+      type: 'employment',
+      requestedBy: row.candidate_email,
+      submittedAt: row.created_at,
+      verificationType: row.verification_type || 'auto',
+      status: row.verification_status || 'pending',
+      position: row.position,
+      companyName: row.company_name,
+      candidateName: row.candidate_name,
+      candidateEmail: row.candidate_email,
+      startDate: row.start_date,
+      endDate: row.end_date,
+    }));
+
+    const companyVerifications = companyVerificationsResult.rows.map(row => ({
+      id: row.id,
+      entityName: row.name,
+      entityType: 'company',
+      type: 'company',
+      requestedBy: row.admin_email || 'N/A',
+      submittedAt: row.created_at,
+      verificationType: 'manual',
+      status: row.verification_status || 'pending',
+      name: row.name,
+      adminName: row.admin_name,
+      email: row.admin_email,
+    }));
+
+    // Combine and sort by submission date
+    const allVerifications = [...employmentVerifications, ...companyVerifications]
+      .sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
+
     res.json({
       success: true,
       stats,
-      verifications: verificationsResult.rows.map(row => ({
-        id: row.id,
-        entityName: `${row.candidate_name} - ${row.position} at ${row.company_name}`,
-        entityType: 'employment',
-        requestedBy: row.candidate_email,
-        submittedAt: row.created_at,
-        verificationType: row.verification_type || 'auto',
-        status: row.verification_status || 'pending',
-      })),
+      verifications: allVerifications,
     });
   } catch (error) {
     next(error);
