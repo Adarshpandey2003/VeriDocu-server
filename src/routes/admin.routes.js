@@ -50,18 +50,18 @@ router.get('/verifications/stats', async (req, res, next) => {
     const compStats = companyStats.rows[0];
 
     const stats = {
-      totalRequests: parseInt(empStats.total_requests) + parseInt(compStats.total_companies),
-      totalManual: parseInt(empStats.total_manual),
-      totalCompanies: parseInt(compStats.total_companies),
-      pending: parseInt(empStats.pending) + parseInt(compStats.pending_companies),
-      pendingCompanies: parseInt(compStats.pending_companies),
-      pendingManual: parseInt(empStats.pending_manual),
-      approved: parseInt(empStats.approved) + parseInt(compStats.approved_companies),
-      approvedCompanies: parseInt(compStats.approved_companies),
-      approvedManual: parseInt(empStats.approved_manual),
-      rejected: parseInt(empStats.rejected) + parseInt(compStats.rejected_companies),
-      rejectedCompanies: parseInt(compStats.rejected_companies),
-      rejectedManual: parseInt(empStats.rejected_manual),
+      totalRequests: (parseInt(empStats.total_requests) || 0) + (parseInt(compStats.total_companies) || 0),
+      totalManual: parseInt(empStats.total_manual) || 0,
+      totalCompanies: parseInt(compStats.total_companies) || 0,
+      pending: (parseInt(empStats.pending) || 0) + (parseInt(compStats.pending_companies) || 0),
+      pendingCompanies: parseInt(compStats.pending_companies) || 0,
+      pendingManual: parseInt(empStats.pending_manual) || 0,
+      approved: (parseInt(empStats.approved) || 0) + (parseInt(compStats.approved_companies) || 0),
+      approvedCompanies: parseInt(compStats.approved_companies) || 0,
+      approvedManual: parseInt(empStats.approved_manual) || 0,
+      rejected: (parseInt(empStats.rejected) || 0) + (parseInt(compStats.rejected_companies) || 0),
+      rejectedCompanies: parseInt(compStats.rejected_companies) || 0,
+      rejectedManual: parseInt(empStats.rejected_manual) || 0,
     };
 
     // Get employment verification list with filters
@@ -144,13 +144,13 @@ router.get('/employments', async (req, res, next) => {
 
     const statsResult = await pool.query(statsQuery);
     const stats = {
-      total: parseInt(statsResult.rows[0].total),
-      pending: parseInt(statsResult.rows[0].pending),
-      pendingManual: parseInt(statsResult.rows[0].pending_manual),
-      verified: parseInt(statsResult.rows[0].verified),
-      verifiedManual: parseInt(statsResult.rows[0].verified_manual),
-      rejected: parseInt(statsResult.rows[0].rejected),
-      rejectedManual: parseInt(statsResult.rows[0].rejected_manual),
+      total: parseInt(statsResult.rows[0].total) || 0,
+      pending: parseInt(statsResult.rows[0].pending) || 0,
+      pendingManual: parseInt(statsResult.rows[0].pending_manual) || 0,
+      verified: parseInt(statsResult.rows[0].verified) || 0,
+      verifiedManual: parseInt(statsResult.rows[0].verified_manual) || 0,
+      rejected: parseInt(statsResult.rows[0].rejected) || 0,
+      rejectedManual: parseInt(statsResult.rows[0].rejected_manual) || 0,
     };
 
     // Get employment list with filters
@@ -370,10 +370,10 @@ router.get('/companies', async (req, res, next) => {
 
     const statsResult = await pool.query(statsQuery);
     const stats = {
-      total: parseInt(statsResult.rows[0].total),
-      pending: parseInt(statsResult.rows[0].pending),
-      verified: parseInt(statsResult.rows[0].verified),
-      rejected: parseInt(statsResult.rows[0].rejected),
+      total: parseInt(statsResult.rows[0].total) || 0,
+      pending: parseInt(statsResult.rows[0].pending) || 0,
+      verified: parseInt(statsResult.rows[0].verified) || 0,
+      rejected: parseInt(statsResult.rows[0].rejected) || 0,
     };
 
     // Get companies list with filters
@@ -611,6 +611,78 @@ router.put('/users/:id/status', async (req, res, next) => {
       success: true,
       message: 'User status updated successfully',
       user: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   PUT /api/admin/employments/:id
+// @desc    Update employment verification details
+// @access  Admin only
+router.put('/employments/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { position, companyName, startDate, endDate, verificationStatus, adminNotes } = req.body;
+
+    const result = await pool.query(
+      `UPDATE employment_history 
+       SET position = $1,
+           company_name = $2,
+           start_date = $3,
+           end_date = $4,
+           verification_status = $5,
+           notes = $6,
+           updated_at = NOW()
+       WHERE id = $7
+       RETURNING *`,
+      [position, companyName, startDate, endDate, verificationStatus, adminNotes, id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Employment record not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Employment verification updated successfully',
+      employment: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   PUT /api/admin/companies/:id
+// @desc    Update company verification details
+// @access  Admin only
+router.put('/companies/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { name, industry, location, verificationStatus, adminNotes } = req.body;
+
+    const result = await pool.query(
+      `UPDATE companies 
+       SET name = $1,
+           industry = $2,
+           location = $3,
+           verification_status = $4,
+           notes = $5,
+           is_verified = $6,
+           updated_at = NOW()
+       WHERE id = $7
+       RETURNING *`,
+      [name, industry, location, verificationStatus, adminNotes, verificationStatus === 'verified', id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Company not found', 404));
+    }
+
+    res.json({
+      success: true,
+      message: 'Company verification updated successfully',
+      company: result.rows[0],
     });
   } catch (error) {
     next(error);
