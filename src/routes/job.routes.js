@@ -803,23 +803,50 @@ router.get('/company/applicants', protect, async (req, res) => {
 
     const result = await pool.query(query, params);
 
+    // Generate fresh signed URLs for resumes
+    const applicantsWithSignedUrls = await Promise.all(
+      result.rows.map(async (app) => {
+        let resumeUrl = app.resume_url;
+        
+        if (resumeUrl) {
+          try {
+            // Extract just the file path if resume_url contains a full URL
+            let resumePath = resumeUrl;
+            if (resumePath.includes('/storage/v1/object/')) {
+              const match = resumePath.match(/\/object\/(?:sign|public)\/[^/]+\/(.+?)(?:\?|$)/);
+              if (match && match[1]) {
+                resumePath = decodeURIComponent(match[1]);
+              }
+            }
+            
+            const rs = await createSignedUrl(BUCKET_NAME, resumePath, 3600);
+            resumeUrl = rs.data?.signedUrl || resumeUrl;
+          } catch (err) {
+            console.warn('Failed to create signed URL for resume:', err);
+          }
+        }
+
+        return {
+          id: app.id,
+          job_id: app.job_id,
+          job_title: app.job_title,
+          status: app.status,
+          applied_at: app.applied_at,
+          updated_at: app.updated_at,
+          cover_letter: app.cover_letter,
+          resume_url: resumeUrl,
+          application_answers: app.application_answers || null,
+          candidate_name: app.candidate_name || 'N/A',
+          candidate_email: app.candidate_email,
+          candidate_phone: app.candidate_phone || 'N/A',
+          candidate_linkedin: app.candidate_linkedin || ''
+        };
+      })
+    );
+
     res.json({
       success: true,
-      applicants: result.rows.map(app => ({
-        id: app.id,
-        job_id: app.job_id,
-        job_title: app.job_title,
-        status: app.status,
-        applied_at: app.applied_at,
-        updated_at: app.updated_at,
-        cover_letter: app.cover_letter,
-        resume_url: app.resume_url,
-        application_answers: app.application_answers || null,
-        candidate_name: app.candidate_name || 'N/A',
-        candidate_email: app.candidate_email,
-        candidate_phone: app.candidate_phone || 'N/A',
-        candidate_linkedin: app.candidate_linkedin || ''
-      }))
+      applicants: applicantsWithSignedUrls
     });
   } catch (error) {
     console.error('Error fetching applicants:', error);
@@ -894,7 +921,17 @@ router.get('/company/applicants/:applicationId', protect, async (req, res) => {
 
     try {
       if (app.resume_url) {
-        const rs = await createSignedUrl(BUCKET_NAME, app.resume_url, 3600);
+        // Extract just the file path if resume_url contains a full URL
+        let resumePath = app.resume_url;
+        if (resumePath.includes('/storage/v1/object/')) {
+          // Extract path after the bucket name
+          const match = resumePath.match(/\/object\/(?:sign|public)\/[^/]+\/(.+?)(?:\?|$)/);
+          if (match && match[1]) {
+            resumePath = decodeURIComponent(match[1]);
+          }
+        }
+        
+        const rs = await createSignedUrl(BUCKET_NAME, resumePath, 3600);
         resumeSigned = rs.data?.signedUrl || null;
       }
     } catch (err) {
