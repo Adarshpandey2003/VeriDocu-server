@@ -301,49 +301,7 @@ router.post(
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
 
-      // Check if OTP verification is required for registration
-      const requireOtpOnRegister = process.env.REQUIRE_OTP_ON_REGISTER === 'true';
-
-      if (!requireOtpOnRegister) {
-
-        // Create user immediately without OTP verification
-        const pwColCreate = await detectPasswordColumn() || 'password_hash';
-        const createQuery = `INSERT INTO users (email, ${pwColCreate}, account_type, name, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, email, account_type, name`;
-        const userResult = await pool.query(createQuery, [email, hashedPassword, accountType, name]);
-
-        const user = userResult.rows[0];
-
-        // If company account, create company profile
-        if (accountType === 'company') {
-          const slug = (companyName || name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-          await pool.query(
-            `INSERT INTO companies (name, slug, user_id, created_at) VALUES ($1, $2, $3, NOW())`,
-            [companyName || name, slug, user.id]
-          );
-        }
-
-        // If candidate account, create candidate profile
-        if (accountType === 'candidate') {
-          await pool.query(
-            `INSERT INTO candidates (user_id, full_name, created_at) VALUES ($1, $2, NOW())`,
-            [user.id, name]
-          );
-        }
-
-        // Generate token
-        const token = generateToken(user.id);
-
-        console.log(`[AUTH] ✅ User registered successfully without OTP: ${email}`);
-
-        return res.status(201).json({
-          success: true,
-          message: 'Account created successfully!',
-          user,
-          token,
-        });
-      }
-
-      // OTP verification required - proceed with OTP flow
+      // OTP verification is always required for registration
       // Generate OTP for email verification
       const code = generateOtpCode();
       
