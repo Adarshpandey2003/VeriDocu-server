@@ -85,7 +85,7 @@ router.put('/profile', protect, async (req, res, next) => {
       return next(new AppError('Access denied. Companies only.', 403));
     }
 
-    const { name, description, industry, size, website, location, logo_url } = req.body;
+    const { name, description, industry, size, website, location, logo_url, cover_image_url } = req.body;
 
     // Incoming profile update received; lengths are intentionally not logged in production
 
@@ -103,7 +103,8 @@ router.put('/profile', protect, async (req, res, next) => {
       size: size ? size.substring(0, 50) : size,
       website: website ? website.substring(0, 255) : website,
       location: location ? location.substring(0, 255) : location,
-      logo_url: logo_url ? logo_url.substring(0, 500) : logo_url
+      logo_url: logo_url ? logo_url.substring(0, 500) : logo_url,
+      cover_image_url: cover_image_url ? cover_image_url.substring(0, 500) : cover_image_url
     };
 
     // Ensure logo_url contains only the path, not a full URL
@@ -134,10 +135,11 @@ router.put('/profile', protect, async (req, res, next) => {
            website = COALESCE($7, website),
            location = COALESCE($8, location),
            logo_url = COALESCE($9, logo_url),
+           cover_image_url = COALESCE($10, cover_image_url),
            updated_at = NOW()
        WHERE user_id = $1
        RETURNING *`,
-      [req.user.id, validatedData.name, slug, validatedData.description, validatedData.industry, validatedData.size, validatedData.website, validatedData.location, validatedData.logo_url]
+      [req.user.id, validatedData.name, slug, validatedData.description, validatedData.industry, validatedData.size, validatedData.website, validatedData.location, validatedData.logo_url, validatedData.cover_image_url]
     );
 
     if (result.rows.length === 0) {
@@ -148,6 +150,38 @@ router.put('/profile', protect, async (req, res, next) => {
       success: true,
       message: 'Profile updated successfully',
       profile: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/companies/search
+// @desc    Search companies by name (for autocomplete)
+// @access  Public
+router.get('/search', async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q || q.trim().length < 2) {
+      return res.json({
+        success: true,
+        companies: []
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, slug, location, industry, logo_url, is_verified 
+       FROM companies 
+       WHERE name ILIKE $1 
+       ORDER BY is_verified DESC, name ASC 
+       LIMIT 10`,
+      [`%${q.trim()}%`]
+    );
+
+    res.json({
+      success: true,
+      companies: result.rows
     });
   } catch (error) {
     next(error);
@@ -344,6 +378,85 @@ router.get('/profile/logo-url', protect, async (req, res, next) => {
 
     // Generate signed URL
     const { data, error } = await getProfilePictureSignedUrl(logoPath);
+
+    if (error) {
+      console.error('Signed URL error:', error);
+      return next(new AppError('Failed to generate access URL', 500));
+    }
+
+    res.json({
+      success: true,
+      signedUrl: data.signedUrl
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/companies/profile/cover-image
+// @desc    Upload cover image for current company
+// @access  Private (Company only)
+router.post('/profile/cover-image', protect, upload.single('cover_image'), async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'company') {
+      return next(new AppError('Access denied. Companies only.', 403));
+    }
+
+    if (!req.file) {
+      return next(new AppError('Please upload a cover image', 400));
+    }
+
+    const userId = req.user.id;
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+
+    // Upload to storage
+    const { data, error, path } = await uploadProfilePicture(userId, fileBuffer, fileName);
+
+    if (error) {
+      console.error('Storage upload error:', error);
+      return next(new AppError('Failed to upload cover image', 500));
+    }
+
+    // Update database with storage path
+    await pool.query(
+      'UPDATE companies SET cover_image_url = $1, updated_at = NOW() WHERE user_id = $2',
+      [path, userId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Cover image uploaded successfully',
+      cover_image_path: path
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/companies/profile/cover-image-url
+// @desc    Get signed URL for current company's cover image
+// @access  Private (Company only)
+router.get('/profile/cover-image-url', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'company') {
+      return next(new AppError('Access denied. Companies only.', 403));
+    }
+
+    // Get the cover image path from database
+    const result = await pool.query(
+      'SELECT cover_image_url FROM companies WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].cover_image_url) {
+      return next(new AppError('No cover image found', 404));
+    }
+
+    const coverImagePath = result.rows[0].cover_image_url;
+
+    // Generate signed URL
+    const { data, error } = await getProfilePictureSignedUrl(coverImagePath);
 
     if (error) {
       console.error('Signed URL error:', error);

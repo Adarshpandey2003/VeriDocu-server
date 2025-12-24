@@ -3,6 +3,7 @@ import pool from '../config/database.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { supabase } from '../config/supabase.js';
+import { BUCKET_NAME, createSignedUrl } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
@@ -93,10 +94,11 @@ router.get('/verifications/stats', async (req, res, next) => {
         eh.is_current,
         eh.created_at,
         u.name as candidate_name,
-        u.email as candidate_email
+        u.email as candidate_email,
+        cand.avatar_url
       FROM employment_history eh
-      JOIN candidates c ON eh.candidate_id = c.id
-      JOIN users u ON c.user_id = u.id
+      JOIN candidates cand ON eh.candidate_id = cand.id
+      JOIN users u ON cand.user_id = u.id
       ${whereClause}
       ORDER BY eh.created_at DESC
       LIMIT 100
@@ -121,6 +123,7 @@ router.get('/verifications/stats', async (req, res, next) => {
       SELECT 
         c.id,
         c.name,
+        c.logo_url,
         c.verification_status,
         c.created_at,
         u.name as admin_name,
@@ -134,37 +137,72 @@ router.get('/verifications/stats', async (req, res, next) => {
 
     const companyVerificationsResult = await pool.query(companyVerificationsQuery, companyQueryParams);
 
-    // Combine employment and company verifications
-    const employmentVerifications = verificationsResult.rows.map(row => ({
-      id: row.id,
-      entityName: `${row.candidate_name} - ${row.position} at ${row.company_name}`,
-      entityType: 'employment',
-      type: 'employment',
-      requestedBy: row.candidate_email,
-      submittedAt: row.created_at,
-      verificationType: row.verification_type || 'auto',
-      status: row.verification_status || 'pending',
-      position: row.position,
-      companyName: row.company_name,
-      candidateName: row.candidate_name,
-      candidateEmail: row.candidate_email,
-      startDate: row.start_date,
-      endDate: row.end_date,
-    }));
+    // Helper function to generate signed URL for images
+    const getSignedImageUrl = async (imageUrl) => {
+      if (!imageUrl) return null;
+      try {
+        // If it's already a full signed URL, return it
+        if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+          return imageUrl;
+        }
+        
+        // Extract file path from URL if it contains the bucket name
+        let filePath = imageUrl;
+        const urlParts = imageUrl.split('/VeriBoard_bucket/');
+        if (urlParts.length >= 2) {
+          filePath = urlParts[1];
+        }
+        
+        // Generate signed URL
+        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+        if (!error && data?.signedUrl) {
+          return data.signedUrl;
+        }
+        
+        console.error('Failed to generate signed URL for:', filePath, error);
+      } catch (err) {
+        console.error('Error generating signed URL:', err);
+      }
+      return null; // Return null if signed URL generation fails
+    };
 
-    const companyVerifications = companyVerificationsResult.rows.map(row => ({
-      id: row.id,
-      entityName: row.name,
-      entityType: 'company',
-      type: 'company',
-      requestedBy: row.admin_email || 'N/A',
-      submittedAt: row.created_at,
-      verificationType: 'manual',
-      status: row.verification_status || 'pending',
-      name: row.name,
-      adminName: row.admin_name,
-      email: row.admin_email,
-    }));
+    // Combine employment and company verifications with signed URLs
+    const employmentVerifications = await Promise.all(
+      verificationsResult.rows.map(async (row) => ({
+        id: row.id,
+        entityName: `${row.candidate_name} - ${row.position} at ${row.company_name}`,
+        entityType: 'employment',
+        type: 'employment',
+        requestedBy: row.candidate_email,
+        submittedAt: row.created_at,
+        verificationType: row.verification_type || 'auto',
+        status: row.verification_status || 'pending',
+        position: row.position,
+        companyName: row.company_name,
+        candidateName: row.candidate_name,
+        candidateEmail: row.candidate_email,
+        startDate: row.start_date,
+        endDate: row.end_date,
+        avatarUrl: await getSignedImageUrl(row.avatar_url),
+      }))
+    );
+
+    const companyVerifications = await Promise.all(
+      companyVerificationsResult.rows.map(async (row) => ({
+        id: row.id,
+        entityName: row.name,
+        entityType: 'company',
+        type: 'company',
+        requestedBy: row.admin_email || 'N/A',
+        submittedAt: row.created_at,
+        verificationType: 'manual',
+        status: row.verification_status || 'pending',
+        name: row.name,
+        adminName: row.admin_name,
+        email: row.admin_email,
+        logoUrl: await getSignedImageUrl(row.logo_url),
+      }))
+    );
 
     // Combine and sort by submission date
     const allVerifications = [...employmentVerifications, ...companyVerifications]
@@ -244,10 +282,11 @@ router.get('/employments', async (req, res, next) => {
         eh.verification_type,
         eh.created_at,
         u.name as candidate_name,
-        u.email as candidate_email
+        u.email as candidate_email,
+        cand.avatar_url
       FROM employment_history eh
-      JOIN candidates c ON eh.candidate_id = c.id
-      JOIN users u ON c.user_id = u.id
+      JOIN candidates cand ON eh.candidate_id = cand.id
+      JOIN users u ON cand.user_id = u.id
       ${whereClause}
       ORDER BY eh.created_at DESC
     `;
@@ -259,6 +298,7 @@ router.get('/employments', async (req, res, next) => {
       stats,
       employments: await Promise.all(employmentsResult.rows.map(async row => {
         let documentUrl = row.document_url;
+        let avatarUrl = row.avatar_url;
         
         // Generate signed URL if document exists
         if (documentUrl) {
@@ -279,6 +319,22 @@ router.get('/employments', async (req, res, next) => {
           }
         }
 
+        // Generate signed URL for avatar
+        if (avatarUrl) {
+          try {
+            const urlParts = avatarUrl.split('/VeriBoard_bucket/');
+            if (urlParts.length >= 2) {
+              const filePath = urlParts[1];
+              const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+              if (!error && data?.signedUrl) {
+                avatarUrl = data.signedUrl;
+              }
+            }
+          } catch (err) {
+            console.error('Error generating signed URL for avatar:', err);
+          }
+        }
+
         return {
           id: row.id,
           candidateName: row.candidate_name,
@@ -292,6 +348,7 @@ router.get('/employments', async (req, res, next) => {
           verificationType: row.verification_type || 'auto',
           createdAt: row.created_at,
           documentUrl,
+          avatarUrl,
         };
       })),
     });
@@ -462,6 +519,7 @@ router.get('/companies', async (req, res, next) => {
         c.is_verified,
         c.hr_verification_status,
         c.hr_document_url,
+        c.logo_url,
         u.created_at,
         c.name as company_name,
         c.industry,
@@ -475,9 +533,10 @@ router.get('/companies', async (req, res, next) => {
 
     const companiesResult = await pool.query(companiesQuery, queryParams);
 
-    // Generate signed URLs for HR documents
+    // Generate signed URLs for HR documents and company logos
     const companies = await Promise.all(companiesResult.rows.map(async row => {
       let hrDocumentUrl = row.hr_document_url;
+      let logoUrl = row.logo_url;
       
       if (hrDocumentUrl) {
         try {
@@ -497,6 +556,21 @@ router.get('/companies', async (req, res, next) => {
         }
       }
 
+      if (logoUrl) {
+        try {
+          const urlParts = logoUrl.split('/VeriBoard_bucket/');
+          if (urlParts.length >= 2) {
+            const filePath = urlParts[1];
+            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+            if (!error && data?.signedUrl) {
+              logoUrl = data.signedUrl;
+            }
+          }
+        } catch (err) {
+          console.error('Error generating signed URL for company logo:', err);
+        }
+      }
+
       return {
         id: row.id,
         email: row.email,
@@ -504,6 +578,7 @@ router.get('/companies', async (req, res, next) => {
         verificationStatus: row.verification_status || 'pending',
         hrVerificationStatus: row.hr_verification_status,
         hrDocumentUrl,
+        logoUrl,
         industry: row.industry,
         companySize: row.company_size,
         website: row.website,
@@ -717,7 +792,7 @@ router.put('/employments/:id', async (req, res, next) => {
 router.put('/companies/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { name, industry, location, verificationStatus, adminNotes } = req.body;
+    const { name, industry, location, verificationStatus } = req.body;
 
     const result = await pool.query(
       `UPDATE companies 
@@ -725,12 +800,11 @@ router.put('/companies/:id', async (req, res, next) => {
            industry = $2,
            location = $3,
            verification_status = $4,
-           notes = $5,
-           is_verified = $6,
+           is_verified = $5,
            updated_at = NOW()
-       WHERE id = $7
+       WHERE id = $6
        RETURNING *`,
-      [name, industry, location, verificationStatus, adminNotes, verificationStatus === 'verified', id]
+      [name, industry, location, verificationStatus, verificationStatus === 'verified', id]
     );
 
     if (result.rows.length === 0) {

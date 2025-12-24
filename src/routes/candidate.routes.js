@@ -111,7 +111,7 @@ router.put('/profile', protect, async (req, res, next) => {
       return next(new AppError('Access denied. Candidates only.', 403));
     }
 
-  const { professional_title, bio, location, phone, linkedin_url, skills, experiences, educations, is_public } = req.body;
+  const { professional_title, bio, location, phone, linkedin_url, skills, experiences, educations, is_public, avatar_url, cover_image_url } = req.body;
 
     // Check if profile exists
     const checkProfile = await pool.query(
@@ -139,10 +139,12 @@ router.put('/profile', protect, async (req, res, next) => {
              linkedin_url = COALESCE($6, linkedin_url),
              skills = COALESCE($7, skills),
              is_public = COALESCE($8, is_public),
+             avatar_url = COALESCE($9, avatar_url),
+             cover_image_url = COALESCE($10, cover_image_url),
              updated_at = NOW()
          WHERE user_id = $1
          RETURNING *`,
-        [req.user.id, professional_title, bio, location, phone, linkedin_url, skills, is_public]
+        [req.user.id, professional_title, bio, location, phone, linkedin_url, skills, is_public, avatar_url, cover_image_url]
       );
     }
 
@@ -442,4 +444,84 @@ router.get('/profile/avatar-url', protect, async (req, res, next) => {
   }
 });
 
+// @route   POST /api/candidates/profile/cover-image
+// @desc    Upload cover image for current candidate
+// @access  Private (Candidate only)
+router.post('/profile/cover-image', protect, upload.single('cover_image'), async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    if (!req.file) {
+      return next(new AppError('Please upload a cover image', 400));
+    }
+
+    const userId = req.user.id;
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+
+    // Upload to storage
+    const { data, error, path } = await uploadProfilePicture(userId, fileBuffer, fileName);
+
+    if (error) {
+      console.error('Storage upload error:', error);
+      return next(new AppError('Failed to upload cover image', 500));
+    }
+
+    // Update database with storage path
+    await pool.query(
+      'UPDATE candidates SET cover_image_url = $1, updated_at = NOW() WHERE user_id = $2',
+      [path, userId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Cover image uploaded successfully',
+      cover_image_path: path
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/candidates/profile/cover-image-url
+// @desc    Get signed URL for current candidate's cover image
+// @access  Private (Candidate only)
+router.get('/profile/cover-image-url', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    // Get the cover image path from database
+    const result = await pool.query(
+      'SELECT cover_image_url FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].cover_image_url) {
+      return next(new AppError('No cover image found', 404));
+    }
+
+    const coverImagePath = result.rows[0].cover_image_url;
+
+    // Generate signed URL
+    const { data, error } = await getProfilePictureSignedUrl(coverImagePath);
+
+    if (error) {
+      console.error('Signed URL error:', error);
+      return next(new AppError('Failed to generate access URL', 500));
+    }
+
+    res.json({
+      success: true,
+      signedUrl: data.signedUrl
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
+
