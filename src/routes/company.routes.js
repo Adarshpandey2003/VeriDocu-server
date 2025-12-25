@@ -3,7 +3,9 @@ import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import multer from 'multer';
-import { uploadProfilePicture, getProfilePictureSignedUrl, uploadCompanyLogo } from '../utils/supabaseStorage.js';
+import { uploadProfilePicture, getProfilePictureSignedUrl, uploadCompanyLogo, createSignedUrl } from '../utils/supabaseStorage.js';
+
+const BUCKET_NAME = 'VeriBoard_bucket';
 
 const router = express.Router();
 
@@ -31,6 +33,35 @@ router.get('/profile', protect, async (req, res, next) => {
     if (req.user.account_type !== 'company') {
       return next(new AppError('Access denied. Companies only.', 403));
     }
+
+    // Helper function to generate signed URLs for images
+    const getSignedImageUrl = async (imageUrl) => {
+      if (!imageUrl) return null;
+      try {
+        // If it's already a full signed URL, return it
+        if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+          return imageUrl;
+        }
+        
+        // Extract file path from URL if it contains the bucket name
+        let filePath = imageUrl;
+        const urlParts = imageUrl.split('/VeriBoard_bucket/');
+        if (urlParts.length >= 2) {
+          filePath = urlParts[1];
+        }
+        
+        // Generate signed URL
+        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+        if (!error && data?.signedUrl) {
+          return data.signedUrl;
+        }
+        
+        console.error('Failed to generate signed URL for:', filePath, error);
+      } catch (err) {
+        console.error('Error generating signed URL:', err);
+      }
+      return null;
+    };
 
     let result = await pool.query(
       `SELECT c.*, u.email,
@@ -67,9 +98,19 @@ router.get('/profile', protect, async (req, res, next) => {
       );
     }
 
+    const profile = result.rows[0];
+    
+    // Generate signed URLs for logo and cover image
+    if (profile.logo_url) {
+      profile.logo_url = await getSignedImageUrl(profile.logo_url);
+    }
+    if (profile.cover_image_url) {
+      profile.cover_image_url = await getSignedImageUrl(profile.cover_image_url);
+    }
+
     res.json({
       success: true,
-      profile: result.rows[0]
+      profile
     });
   } catch (error) {
     next(error);

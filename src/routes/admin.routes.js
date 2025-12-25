@@ -606,8 +606,7 @@ router.get('/companies/:id/document', async (req, res, next) => {
     const result = await pool.query(
       `SELECT c.hr_document_url 
        FROM companies c
-       JOIN users u ON c.user_id = u.id
-       WHERE u.id = $1 AND u.account_type = 'company'`,
+       WHERE c.id = $1`,
       [id]
     );
 
@@ -815,6 +814,126 @@ router.put('/companies/:id', async (req, res, next) => {
       success: true,
       message: 'Company verification updated successfully',
       company: result.rows[0],
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/users
+// @desc    Get all users with pagination
+// @access  Admin only
+router.get('/users', async (req, res, next) => {
+  try {
+    const { page = 1, limit = 20, accountType, search } = req.query;
+    const offset = (page - 1) * limit;
+
+    // Build WHERE conditions
+    let whereConditions = [];
+    let queryParams = [];
+    let paramIndex = 1;
+
+    if (accountType && accountType !== 'all') {
+      whereConditions.push(`account_type = $${paramIndex}`);
+      queryParams.push(accountType);
+      paramIndex++;
+    }
+
+    if (search) {
+      whereConditions.push(`(name ILIKE $${paramIndex} OR email ILIKE $${paramIndex})`);
+      queryParams.push(`%${search}%`);
+      paramIndex++;
+    }
+
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    // Get total count
+    const countQuery = `SELECT COUNT(*) as total FROM users ${whereClause}`;
+    const countResult = await pool.query(countQuery, queryParams);
+    const totalUsers = parseInt(countResult.rows[0].total);
+    const totalPages = Math.ceil(totalUsers / limit);
+
+    // Get users
+    const usersQuery = `
+      SELECT 
+        id, 
+        email, 
+        name, 
+        account_type, 
+        is_verified, 
+        created_at,
+        updated_at
+      FROM users 
+      ${whereClause}
+      ORDER BY created_at DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    
+    queryParams.push(limit, offset);
+    const usersResult = await pool.query(usersQuery, queryParams);
+
+    // Get stats
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN account_type = 'candidate' THEN 1 END) as candidates,
+        COUNT(CASE WHEN account_type = 'company' THEN 1 END) as companies,
+        COUNT(CASE WHEN account_type = 'admin' THEN 1 END) as admins
+      FROM users
+    `;
+    const statsResult = await pool.query(statsQuery);
+    const stats = {
+      total: parseInt(statsResult.rows[0].total),
+      candidates: parseInt(statsResult.rows[0].candidates),
+      companies: parseInt(statsResult.rows[0].companies),
+      admins: parseInt(statsResult.rows[0].admins)
+    };
+
+    res.json({
+      success: true,
+      users: usersResult.rows,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages,
+        totalUsers,
+        limit: parseInt(limit),
+        hasMore: page < totalPages
+      },
+      stats
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/users/:id
+// @desc    Get single user details
+// @access  Admin only
+router.get('/users/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT 
+        id, 
+        email, 
+        name, 
+        account_type, 
+        is_verified, 
+        created_at,
+        updated_at
+      FROM users 
+      WHERE id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('User not found', 404));
+    }
+
+    res.json({
+      success: true,
+      user: result.rows[0]
     });
   } catch (error) {
     next(error);

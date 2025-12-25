@@ -523,5 +523,122 @@ router.get('/profile/cover-image-url', protect, async (req, res, next) => {
   }
 });
 
+// @route   GET /api/candidates/:id
+// @desc    Get candidate profile by ID (public/admin view)
+// @access  Public
+router.get('/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // First try to find by user_id
+    let result = await pool.query(
+      `SELECT c.*, u.email, u.name as user_name
+       FROM candidates c
+       JOIN users u ON c.user_id = u.id
+       WHERE u.id = $1`,
+      [id]
+    );
+
+    // If not found by user_id, try by candidate_id
+    if (result.rows.length === 0) {
+      result = await pool.query(
+        `SELECT c.*, u.email, u.name as user_name
+         FROM candidates c
+         JOIN users u ON c.user_id = u.id
+         WHERE c.id = $1`,
+        [id]
+      );
+    }
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Candidate not found', 404));
+    }
+
+    // Fetch employment history
+    const employmentResult = await pool.query(
+      `SELECT id, company_name as company, position as job_title, location,
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM employment_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [result.rows[0].id]
+    );
+
+    // Fetch education history
+    const educationResult = await pool.query(
+      `SELECT id, institution, degree, field_of_study, 
+              TO_CHAR(start_date, 'YYYY-MM') as start_month,
+              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
+              is_current, description, verification_status
+       FROM education_history
+       WHERE candidate_id = $1
+       ORDER BY start_date DESC`,
+      [result.rows[0].id]
+    );
+
+    const candidate = {
+      ...result.rows[0],
+      experiences: employmentResult.rows,
+      educations: educationResult.rows
+    };
+
+    res.json({
+      success: true,
+      candidate
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/candidates/:id/avatar-url
+// @desc    Get candidate avatar signed URL by ID
+// @access  Public
+router.get('/:id/avatar-url', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // First try to find by user_id
+    let result = await pool.query(
+      `SELECT c.avatar_url
+       FROM candidates c
+       JOIN users u ON c.user_id = u.id
+       WHERE u.id = $1`,
+      [id]
+    );
+
+    // If not found by user_id, try by candidate_id
+    if (result.rows.length === 0) {
+      result = await pool.query(
+        `SELECT avatar_url FROM candidates WHERE id = $1`,
+        [id]
+      );
+    }
+
+    if (result.rows.length === 0 || !result.rows[0].avatar_url) {
+      return next(new AppError('No avatar found', 404));
+    }
+
+    const avatarPath = result.rows[0].avatar_url;
+
+    // Generate signed URL
+    const { data, error } = await getProfilePictureSignedUrl(avatarPath);
+
+    if (error) {
+      console.error('Signed URL error:', error);
+      return next(new AppError('Failed to generate access URL', 500));
+    }
+
+    res.json({
+      success: true,
+      signedUrl: data.signedUrl
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
 
