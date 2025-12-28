@@ -1154,25 +1154,57 @@ router.get('/applications/my-applications', protect, async (req, res) => {
       ORDER BY ja.applied_at DESC
     `, [userId]);
     
-    const applications = result.rows.map(app => ({
-      id: app.id,
-      jobId: app.job_id,
-      status: app.status,
-      appliedAt: app.applied_at,
-      updatedAt: app.updated_at,
-      coverLetter: app.cover_letter,
-      resumeUrl: app.resume_url,
-      applicationAnswers: app.application_answers || null,
-      job: {
-        title: app.job_title,
-        location: app.job_location,
-        employmentType: app.job_employment_type,
-        salaryMin: app.job_salary_min,
-        salaryMax: app.job_salary_max,
-        company: app.company_name,
-        logo: app.company_logo,
-        slug: app.company_slug
+    // Helper function to generate signed URLs for company logos
+    const getSignedLogoUrl = async (logoUrl) => {
+      if (!logoUrl) return null;
+      try {
+        // If it's already a full URL, return it
+        if (logoUrl.startsWith('http://') || logoUrl.startsWith('https://')) {
+          return logoUrl;
+        }
+        
+        // Extract file path from URL if it contains the bucket name
+        let filePath = logoUrl;
+        const urlParts = logoUrl.split('/VeriBoard_bucket/');
+        if (urlParts.length >= 2) {
+          filePath = urlParts[1];
+        }
+        
+        // Generate signed URL
+        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+        if (!error && data?.signedUrl) {
+          return data.signedUrl;
+        }
+      } catch (err) {
+        console.error('Error generating signed URL for logo:', err);
       }
+      return null;
+    };
+    
+    // Generate signed URLs for all company logos
+    const applications = await Promise.all(result.rows.map(async app => {
+      const signedLogoUrl = await getSignedLogoUrl(app.company_logo);
+      
+      return {
+        id: app.id,
+        jobId: app.job_id,
+        status: app.status,
+        appliedAt: app.applied_at,
+        updatedAt: app.updated_at,
+        coverLetter: app.cover_letter,
+        resumeUrl: app.resume_url,
+        applicationAnswers: app.application_answers || null,
+        job: {
+          title: app.job_title,
+          location: app.job_location,
+          employmentType: app.job_employment_type,
+          salaryMin: app.job_salary_min,
+          salaryMax: app.job_salary_max,
+          company: app.company_name,
+          logo: signedLogoUrl,
+          slug: app.company_slug
+        }
+      };
     }));
     
     res.json({ 

@@ -60,6 +60,29 @@ export async function uploadProfilePicture(userId, fileBuffer, fileName, options
 }
 
 /**
+ * Upload a cover image to the profile_pic folder
+ * @param {string} userId - user identifier
+ * @param {Buffer|Uint8Array} fileBuffer - image file buffer
+ * @param {string} fileName - original file name (for extension)
+ * @param {object} options - optional: { upsert }
+ * @returns {Promise<{error, data, path}>}
+ */
+export async function uploadCoverImage(userId, fileBuffer, fileName, options = {}) {
+  const { upsert = true } = options;
+  const ext = fileName.split('.').pop().toLowerCase();
+  // Use a timestamp to ensure unique filenames and avoid conflicts with profile pictures
+  const timestamp = Date.now();
+  const path = `${FOLDERS.PROFILE_PIC}/${userId}_cover_${timestamp}.${ext}`;
+
+  const { data, error } = await uploadToBucket(BUCKET_NAME, path, fileBuffer, {
+    contentType: `image/${ext}`,
+    upsert,
+  });
+
+  return { data, error, path: error ? null : path };
+}
+
+/**
  * Upload a company logo to the company_logo folder
  * @param {string} userId - user identifier (company user)
  * @param {Buffer|Uint8Array} fileBuffer - image file buffer
@@ -152,6 +175,7 @@ export async function getProfilePictureSignedUrl(path, expiresInSeconds = 3600) 
 export default {
   uploadToBucket,
   uploadProfilePicture,
+  uploadCoverImage,
   uploadCompanyLogo,
   getPublicUrl,
   createSignedUrl,

@@ -288,21 +288,52 @@ router.get('/:slug', async (req, res, next) => {
 
     const companyRow = result.rows[0];
 
-    // If logo_url is a storage path, try to convert it to a signed URL for client consumption
+    // Helper function to generate signed URLs
+    const getSignedImageUrl = async (imageUrl) => {
+      if (!imageUrl) return null;
+      try {
+        // If it's already a full signed URL, return it
+        if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+          return imageUrl;
+        }
+        
+        // Extract file path from URL if it contains the bucket name
+        let filePath = imageUrl;
+        const urlParts = imageUrl.split('/VeriBoard_bucket/');
+        if (urlParts.length >= 2) {
+          filePath = urlParts[1];
+        }
+        
+        // Generate signed URL
+        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+        if (!error && data?.signedUrl) {
+          return data.signedUrl;
+        }
+        
+        console.error('Failed to generate signed URL for:', filePath, error);
+      } catch (err) {
+        console.error('Error generating signed URL:', err);
+      }
+      return imageUrl; // Fallback to original
+    };
+
+    // Generate signed URL for logo
     try {
       if (companyRow.logo_url) {
-        const { data, error } = await getProfilePictureSignedUrl(companyRow.logo_url, 3600);
-        if (!error && data?.signedUrl) {
-          // Provide a convenient field that contains the signed URL
-          companyRow.companyLogo = data.signedUrl;
-        } else {
-          // Fall back to returning the original path in logo_url
-          companyRow.companyLogo = companyRow.logo_url;
-        }
+        companyRow.companyLogo = await getSignedImageUrl(companyRow.logo_url);
       }
     } catch (err) {
       console.warn('Failed to generate signed URL for company logo:', err);
       companyRow.companyLogo = companyRow.logo_url || null;
+    }
+
+    // Generate signed URL for cover image
+    try {
+      if (companyRow.cover_image_url) {
+        companyRow.cover_image_url = await getSignedImageUrl(companyRow.cover_image_url);
+      }
+    } catch (err) {
+      console.warn('Failed to generate signed URL for cover image:', err);
     }
 
     res.json({
@@ -415,10 +446,24 @@ router.get('/profile/logo-url', protect, async (req, res, next) => {
       return next(new AppError('No company logo found', 404));
     }
 
-    const logoPath = result.rows[0].logo_url;
+    let logoPath = result.rows[0].logo_url;
+
+    // If it's already a full signed URL, return it
+    if (logoPath.startsWith('http://') || logoPath.startsWith('https://')) {
+      return res.json({
+        success: true,
+        signedUrl: logoPath
+      });
+    }
+
+    // Extract file path from URL if it contains the bucket name
+    const urlParts = logoPath.split('/VeriBoard_bucket/');
+    if (urlParts.length >= 2) {
+      logoPath = urlParts[1];
+    }
 
     // Generate signed URL
-    const { data, error } = await getProfilePictureSignedUrl(logoPath);
+    const { data, error } = await createSignedUrl(BUCKET_NAME, logoPath, 3600);
 
     if (error) {
       console.error('Signed URL error:', error);

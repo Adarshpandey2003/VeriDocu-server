@@ -3,7 +3,7 @@ import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import multer from 'multer';
-import { uploadProfilePicture, getProfilePictureSignedUrl, uploadToBucket, createSignedUrl, BUCKET_NAME, FOLDERS } from '../utils/supabaseStorage.js';
+import { uploadProfilePicture, uploadCoverImage, getProfilePictureSignedUrl, createSignedUrl, BUCKET_NAME } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
@@ -461,8 +461,8 @@ router.post('/profile/cover-image', protect, upload.single('cover_image'), async
     const fileBuffer = req.file.buffer;
     const fileName = req.file.originalname;
 
-    // Upload to storage
-    const { data, error, path } = await uploadProfilePicture(userId, fileBuffer, fileName);
+    // Upload to storage using uploadCoverImage (not uploadProfilePicture)
+    const { data, error, path } = await uploadCoverImage(userId, fileBuffer, fileName);
 
     if (error) {
       console.error('Storage upload error:', error);
