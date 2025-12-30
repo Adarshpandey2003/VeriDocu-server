@@ -93,6 +93,8 @@ router.get('/verifications/stats', async (req, res, next) => {
         eh.end_date,
         eh.is_current,
         eh.created_at,
+        cand.id as candidate_id,
+        u.id as user_id,
         u.name as candidate_name,
         u.email as candidate_email,
         cand.avatar_url
@@ -123,6 +125,7 @@ router.get('/verifications/stats', async (req, res, next) => {
       SELECT 
         c.id,
         c.name,
+        c.slug,
         c.logo_url,
         c.verification_status,
         c.created_at,
@@ -181,6 +184,8 @@ router.get('/verifications/stats', async (req, res, next) => {
         companyName: row.company_name,
         candidateName: row.candidate_name,
         candidateEmail: row.candidate_email,
+        candidateId: row.candidate_id,
+        candidateUserId: row.user_id,
         startDate: row.start_date,
         endDate: row.end_date,
         avatarUrl: await getSignedImageUrl(row.avatar_url),
@@ -198,6 +203,7 @@ router.get('/verifications/stats', async (req, res, next) => {
         verificationType: 'manual',
         status: row.verification_status || 'pending',
         name: row.name,
+        slug: row.slug,
         adminName: row.admin_name,
         email: row.admin_email,
         logoUrl: await getSignedImageUrl(row.logo_url),
@@ -274,6 +280,7 @@ router.get('/employments', async (req, res, next) => {
       SELECT 
         eh.id,
         eh.company_name,
+        eh.company_id,
         eh.position,
         eh.start_date,
         eh.end_date,
@@ -281,12 +288,16 @@ router.get('/employments', async (req, res, next) => {
         eh.verification_status,
         eh.verification_type,
         eh.created_at,
+        cand.id as candidate_id,
         u.name as candidate_name,
         u.email as candidate_email,
-        cand.avatar_url
+        cand.avatar_url,
+        comp.slug as company_slug,
+        comp.logo_url as company_logo
       FROM employment_history eh
       JOIN candidates cand ON eh.candidate_id = cand.id
       JOIN users u ON cand.user_id = u.id
+      LEFT JOIN companies comp ON eh.company_id = comp.id
       ${whereClause}
       ORDER BY eh.created_at DESC
     `;
@@ -322,24 +333,50 @@ router.get('/employments', async (req, res, next) => {
         // Generate signed URL for avatar
         if (avatarUrl) {
           try {
+            // Extract file path - handle both full URLs and relative paths
+            let filePath = avatarUrl;
             const urlParts = avatarUrl.split('/VeriBoard_bucket/');
             if (urlParts.length >= 2) {
-              const filePath = urlParts[1];
-              const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
-              if (!error && data?.signedUrl) {
-                avatarUrl = data.signedUrl;
-              }
+              filePath = urlParts[1];
+            }
+            
+            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+            if (!error && data?.signedUrl) {
+              avatarUrl = data.signedUrl;
             }
           } catch (err) {
             console.error('Error generating signed URL for avatar:', err);
           }
         }
 
+        // Generate signed URL for company logo
+        let companyLogoUrl = row.company_logo;
+        if (companyLogoUrl) {
+          try {
+            // Extract file path - handle both full URLs and relative paths
+            let filePath = companyLogoUrl;
+            const urlParts = companyLogoUrl.split('/VeriBoard_bucket/');
+            if (urlParts.length >= 2) {
+              filePath = urlParts[1];
+            }
+            
+            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+            if (!error && data?.signedUrl) {
+              companyLogoUrl = data.signedUrl;
+            }
+          } catch (err) {
+            console.error('Error generating signed URL for company logo:', err);
+          }
+        }
+
         return {
           id: row.id,
+          candidateId: row.candidate_id,
           candidateName: row.candidate_name,
           candidateEmail: row.candidate_email,
           companyName: row.company_name,
+          companySlug: row.company_slug,
+          companyLogo: companyLogoUrl,
           position: row.position,
           startDate: row.start_date,
           endDate: row.end_date,
@@ -520,6 +557,7 @@ router.get('/companies', async (req, res, next) => {
         c.hr_verification_status,
         c.hr_document_url,
         c.logo_url,
+        c.slug,
         u.created_at,
         c.name as company_name,
         c.industry,
@@ -540,16 +578,19 @@ router.get('/companies', async (req, res, next) => {
       
       if (hrDocumentUrl) {
         try {
+          // Extract file path - handle both full URLs and relative paths
+          let filePath = hrDocumentUrl;
           const urlParts = hrDocumentUrl.split('/VeriBoard_bucket/');
           if (urlParts.length >= 2) {
-            const filePath = urlParts[1];
-            const { data, error } = await supabase.storage
-              .from('VeriBoard_bucket')
-              .createSignedUrl(filePath, 3600);
-            
-            if (!error && data?.signedUrl) {
-              hrDocumentUrl = data.signedUrl;
-            }
+            filePath = urlParts[1];
+          }
+          
+          const { data, error } = await supabase.storage
+            .from('VeriBoard_bucket')
+            .createSignedUrl(filePath, 3600);
+          
+          if (!error && data?.signedUrl) {
+            hrDocumentUrl = data.signedUrl;
           }
         } catch (err) {
           console.error('Error generating signed URL for HR document:', err);
@@ -558,13 +599,16 @@ router.get('/companies', async (req, res, next) => {
 
       if (logoUrl) {
         try {
+          // Extract file path - handle both full URLs and relative paths
+          let filePath = logoUrl;
           const urlParts = logoUrl.split('/VeriBoard_bucket/');
           if (urlParts.length >= 2) {
-            const filePath = urlParts[1];
-            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
-            if (!error && data?.signedUrl) {
-              logoUrl = data.signedUrl;
-            }
+            filePath = urlParts[1];
+          }
+          
+          const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+          if (!error && data?.signedUrl) {
+            logoUrl = data.signedUrl;
           }
         } catch (err) {
           console.error('Error generating signed URL for company logo:', err);
@@ -575,6 +619,7 @@ router.get('/companies', async (req, res, next) => {
         id: row.id,
         email: row.email,
         name: row.company_name || row.name,
+        slug: row.slug,
         verificationStatus: row.verification_status || 'pending',
         hrVerificationStatus: row.hr_verification_status,
         hrDocumentUrl,

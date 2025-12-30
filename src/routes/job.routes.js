@@ -773,9 +773,11 @@ router.get('/company/applicants', protect, async (req, res) => {
         j.id as job_id,
         u.id as user_id,
         u.email as candidate_email,
+        c.id as candidate_id,
         c.full_name as candidate_name,
         c.phone as candidate_phone,
-        c.linkedin_url as candidate_linkedin
+        c.linkedin_url as candidate_linkedin,
+        c.avatar_url as candidate_avatar
       FROM job_applications ja
       JOIN jobs j ON ja.job_id = j.id
       JOIN users u ON ja.user_id = u.id
@@ -803,10 +805,11 @@ router.get('/company/applicants', protect, async (req, res) => {
 
     const result = await pool.query(query, params);
 
-    // Generate fresh signed URLs for resumes
+    // Generate fresh signed URLs for resumes and avatars
     const applicantsWithSignedUrls = await Promise.all(
       result.rows.map(async (app) => {
         let resumeUrl = app.resume_url;
+        let avatarUrl = app.candidate_avatar;
         
         if (resumeUrl) {
           try {
@@ -826,6 +829,22 @@ router.get('/company/applicants', protect, async (req, res) => {
           }
         }
 
+        if (avatarUrl) {
+          try {
+            let filePath = avatarUrl;
+            const urlParts = avatarUrl.split('/VeriBoard_bucket/');
+            if (urlParts.length >= 2) {
+              filePath = urlParts[1];
+            }
+            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+            if (!error && data?.signedUrl) {
+              avatarUrl = data.signedUrl;
+            }
+          } catch (error) {
+            console.error('Error generating avatar URL:', error);
+          }
+        }
+
         return {
           id: app.id,
           job_id: app.job_id,
@@ -836,10 +855,12 @@ router.get('/company/applicants', protect, async (req, res) => {
           cover_letter: app.cover_letter,
           resume_url: resumeUrl,
           application_answers: app.application_answers || null,
+          candidate_id: app.candidate_id,
           candidate_name: app.candidate_name || 'N/A',
           candidate_email: app.candidate_email,
           candidate_phone: app.candidate_phone || 'N/A',
-          candidate_linkedin: app.candidate_linkedin || ''
+          candidate_linkedin: app.candidate_linkedin || '',
+          candidate_avatar: avatarUrl
         };
       })
     );

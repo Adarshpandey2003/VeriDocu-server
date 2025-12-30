@@ -146,7 +146,9 @@ router.get('/verification-requests', protect, authorize('company'), async (req, 
         eh.created_at,
         u.name as "candidateName",
         u.email as "candidateEmail",
-        c.user_id as candidate_user_id
+        c.id as candidate_id,
+        c.user_id as candidate_user_id,
+        c.avatar_url as candidate_avatar
       FROM employment_history eh
       JOIN candidates c ON eh.candidate_id = c.id
       JOIN users u ON c.user_id = u.id
@@ -168,6 +170,7 @@ router.get('/verification-requests', protect, authorize('company'), async (req, 
 
     const requests = await Promise.all(result.rows.map(async row => {
       let documentUrl = row.document_url;
+      let avatarUrl = row.candidate_avatar;
       
       // Generate signed URL if document exists
       if (documentUrl) {
@@ -188,10 +191,33 @@ router.get('/verification-requests', protect, authorize('company'), async (req, 
         }
       }
 
+      // Generate signed URL for avatar
+      if (avatarUrl) {
+        try {
+          let filePath = avatarUrl;
+          const urlParts = avatarUrl.split('/VeriBoard_bucket/');
+          if (urlParts.length >= 2) {
+            filePath = urlParts[1];
+          }
+          const { data, error } = await supabase.storage
+            .from('VeriBoard_bucket')
+            .createSignedUrl(filePath, 3600);
+          
+          if (!error && data?.signedUrl) {
+            avatarUrl = data.signedUrl;
+          }
+        } catch (err) {
+          console.error('Error generating avatar URL:', err);
+        }
+      }
+
       return {
         id: row.id,
         candidateName: row.candidateName,
         candidateEmail: row.candidateEmail,
+        candidateId: row.candidate_id,
+        candidateUserId: row.candidate_user_id,
+        candidateAvatar: avatarUrl,
         position: row.position,
         startDate: row.start_date,
         endDate: row.end_date,

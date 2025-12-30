@@ -63,16 +63,40 @@ router.get('/profile', protect, async (req, res, next) => {
       });
     }
 
-    // Fetch employment history
+    // Fetch employment history with company details
     const employmentResult = await pool.query(
-      `SELECT id, company_name as company, position as job_title, location,
-              TO_CHAR(start_date, 'YYYY-MM') as start_month,
-              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
-              is_current, description, verification_status
-       FROM employment_history
-       WHERE candidate_id = $1
-       ORDER BY start_date DESC`,
+      `SELECT eh.id, eh.company_name, eh.position as job_title, eh.location,
+              TO_CHAR(eh.start_date, 'YYYY-MM') as start_month,
+              CASE WHEN eh.is_current THEN NULL ELSE TO_CHAR(eh.end_date, 'YYYY-MM') END as end_month,
+              eh.is_current, eh.description, eh.verification_status,
+              c.logo_url as company_logo, c.slug as company_slug
+       FROM employment_history eh
+       LEFT JOIN companies c ON eh.company_id = c.id
+       WHERE eh.candidate_id = $1
+       ORDER BY eh.start_date DESC`,
       [result.rows[0].id]
+    );
+    
+    // Generate signed URLs for company logos
+    const experiencesWithLogos = await Promise.all(
+      employmentResult.rows.map(async (exp) => {
+        if (exp.company_logo) {
+          try {
+            let filePath = exp.company_logo;
+            const urlParts = exp.company_logo.split('/VeriBoard_bucket/');
+            if (urlParts.length >= 2) {
+              filePath = urlParts[1];
+            }
+            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+            if (!error && data?.signedUrl) {
+              exp.company_logo = data.signedUrl;
+            }
+          } catch (error) {
+            console.error('Error generating company logo URL:', error);
+          }
+        }
+        return exp;
+      })
     );
 
     // Fetch education history
@@ -89,7 +113,7 @@ router.get('/profile', protect, async (req, res, next) => {
 
     const profile = {
       ...result.rows[0],
-      experiences: employmentResult.rows,
+      experiences: experiencesWithLogos,
       educations: educationResult.rows
     };
 
@@ -266,16 +290,40 @@ router.get('/:id', async (req, res, next) => {
       return next(new AppError('Candidate profile not found or not public', 404));
     }
 
-    // Fetch employment history
+    // Fetch employment history with company details
     const employmentResult = await pool.query(
-      `SELECT id, company_name as company, position as job_title, location,
-              TO_CHAR(start_date, 'YYYY-MM') as start_month,
-              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
-              is_current, description, verification_status
-       FROM employment_history
-       WHERE candidate_id = $1
-       ORDER BY start_date DESC`,
+      `SELECT eh.id, eh.company_name, eh.position as job_title, eh.location,
+              TO_CHAR(eh.start_date, 'YYYY-MM') as start_month,
+              CASE WHEN eh.is_current THEN NULL ELSE TO_CHAR(eh.end_date, 'YYYY-MM') END as end_month,
+              eh.is_current, eh.description, eh.verification_status,
+              c.logo_url as company_logo, c.slug as company_slug
+       FROM employment_history eh
+       LEFT JOIN companies c ON eh.company_id = c.id
+       WHERE eh.candidate_id = $1
+       ORDER BY eh.start_date DESC`,
       [req.params.id]
+    );
+    
+    // Generate signed URLs for company logos
+    const experiencesWithLogos = await Promise.all(
+      employmentResult.rows.map(async (exp) => {
+        if (exp.company_logo) {
+          try {
+            let filePath = exp.company_logo;
+            const urlParts = exp.company_logo.split('/VeriBoard_bucket/');
+            if (urlParts.length >= 2) {
+              filePath = urlParts[1];
+            }
+            const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+            if (!error && data?.signedUrl) {
+              exp.company_logo = data.signedUrl;
+            }
+          } catch (error) {
+            console.error('Error generating company logo URL:', error);
+          }
+        }
+        return exp;
+      })
     );
 
     // Fetch education history
@@ -295,7 +343,7 @@ router.get('/:id', async (req, res, next) => {
     const profile = {
       ...row,
       name: row.full_name || row.username || null,
-      experiences: employmentResult.rows,
+      experiences: experiencesWithLogos,
       educations: educationResult.rows
     };
 
@@ -625,6 +673,49 @@ router.get('/:id/avatar-url', async (req, res, next) => {
 
     // Generate signed URL
     const { data, error } = await getProfilePictureSignedUrl(avatarPath);
+
+    if (error) {
+      console.error('Signed URL error:', error);
+      return next(new AppError('Failed to generate access URL', 500));
+    }
+
+    res.json({
+      success: true,
+      signedUrl: data.signedUrl
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/candidates/:id/cover-image-url
+// @desc    Get candidate cover image signed URL by ID
+// @access  Public
+router.get('/:id/cover-image-url', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Try to find by candidate_id
+    const result = await pool.query(
+      `SELECT cover_image_url FROM candidates WHERE id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].cover_image_url) {
+      return next(new AppError('No cover image found', 404));
+    }
+
+    const coverImagePath = result.rows[0].cover_image_url;
+    
+    // Extract file path from URL if it contains the bucket name
+    let filePath = coverImagePath;
+    const urlParts = coverImagePath.split('/VeriBoard_bucket/');
+    if (urlParts.length >= 2) {
+      filePath = urlParts[1];
+    }
+
+    // Generate signed URL
+    const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
 
     if (error) {
       console.error('Signed URL error:', error);
