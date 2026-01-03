@@ -3,7 +3,7 @@ import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import multer from 'multer';
-import { uploadProfilePicture, uploadCoverImage, getProfilePictureSignedUrl, createSignedUrl, BUCKET_NAME } from '../utils/supabaseStorage.js';
+import { uploadProfilePicture, uploadCoverImage, getProfilePictureSignedUrl, createSignedUrl, BUCKET_NAME, FOLDERS, uploadToBucket } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
@@ -411,7 +411,28 @@ const resumeUpload = multer({
 // @route   POST /api/candidates/profile/resume
 // @desc    Upload candidate resume and save path on profile
 // @access  Private (Candidate only)
-router.post('/profile/resume', protect, resumeUpload.single('resume'), async (req, res, next) => {
+router.post('/profile/resume', protect, (req, res, next) => {
+  resumeUpload.single('resume')(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({
+          success: false,
+          message: 'File size exceeded. Maximum allowed size is 10MB.'
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message: err.message
+      });
+    } else if (err) {
+      return res.status(400).json({
+        success: false,
+        message: err.message || 'File upload failed'
+      });
+    }
+    next();
+  });
+}, async (req, res, next) => {
   try {
     if (req.user.account_type !== 'candidate') {
       return next(new AppError('Access denied. Candidates only.', 403));
