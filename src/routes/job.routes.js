@@ -1275,24 +1275,36 @@ router.get('/:id', async (req, res) => {
       console.warn('Failed to create signed URL for company logo:', err);
     }
 
-    // Track view automatically if user is authenticated (limit to once per day per user per job)
+    // Track view automatically (limit to once per day per user/IP per job)
     const userId = req.user?.id;
-    if (userId) {
+    const ipAddress = req.ip || req.connection.remoteAddress;
+    
+    if (userId || ipAddress) {
       try {
-        // Check if user already viewed this job today
+        // Check if user/IP already viewed this job today
         const todayStart = new Date();
         todayStart.setHours(0, 0, 0, 0);
         
-        const existingView = await pool.query(`
-          SELECT id FROM job_views 
-          WHERE job_id = $1 AND user_id = $2 AND viewed_at >= $3
-        `, [id, userId, todayStart]);
+        let existingView;
+        if (userId) {
+          // For authenticated users, check by user_id
+          existingView = await pool.query(`
+            SELECT id FROM job_views 
+            WHERE job_id = $1 AND user_id = $2 AND viewed_at >= $3
+          `, [id, userId, todayStart]);
+        } else {
+          // For unauthenticated users, check by IP address
+          existingView = await pool.query(`
+            SELECT id FROM job_views 
+            WHERE job_id = $1 AND ip_address = $2 AND user_id IS NULL AND viewed_at >= $3
+          `, [id, ipAddress, todayStart]);
+        }
         
         if (existingView.rows.length === 0) {
           await pool.query(`
             INSERT INTO job_views (job_id, user_id, ip_address, user_agent)
             VALUES ($1, $2, $3, $4)
-          `, [id, userId, req.ip, req.get('user-agent')]);
+          `, [id, userId, ipAddress, req.get('user-agent')]);
         }
       } catch (viewError) {
         // Silently fail view tracking - don't block the request

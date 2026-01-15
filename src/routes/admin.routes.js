@@ -802,6 +802,22 @@ router.put('/employments/:id', async (req, res, next) => {
     const { id } = req.params;
     const { position, companyName, startDate, endDate, verificationStatus, adminNotes } = req.body;
 
+    // First get the current employment record to check for changes and get candidate info
+    const currentRecord = await pool.query(
+      `SELECT eh.*, c.user_id as candidate_user_id, c.id as candidate_id
+       FROM employment_history eh
+       JOIN candidates c ON eh.candidate_id = c.id
+       WHERE eh.id = $1`,
+      [id]
+    );
+
+    if (currentRecord.rows.length === 0) {
+      return next(new AppError('Employment record not found', 404));
+    }
+
+    const previousRecord = currentRecord.rows[0];
+    const candidateUserId = previousRecord.candidate_user_id;
+
     const result = await pool.query(
       `UPDATE employment_history 
        SET position = $1,
@@ -818,6 +834,43 @@ router.put('/employments/:id', async (req, res, next) => {
 
     if (result.rows.length === 0) {
       return next(new AppError('Employment record not found', 404));
+    }
+
+    // Create notification if status changed or admin notes were added
+    const statusChanged = previousRecord.verification_status !== verificationStatus;
+    const notesAdded = adminNotes && adminNotes !== previousRecord.notes;
+
+    if (candidateUserId && (statusChanged || notesAdded)) {
+      let notificationTitle = '';
+      let notificationMessage = '';
+      let notificationType = 'verification_update';
+
+      if (statusChanged) {
+        const statusLabels = {
+          'verified': 'Verified',
+          'rejected': 'Rejected',
+          'pending': 'Under Review'
+        };
+        notificationTitle = `Employment Verification ${statusLabels[verificationStatus] || 'Updated'}`;
+        notificationMessage = `Your employment at ${companyName} as ${position} has been ${statusLabels[verificationStatus]?.toLowerCase() || 'updated'}.`;
+      } else if (notesAdded) {
+        notificationTitle = 'Admin Note Added to Employment';
+        notificationMessage = `An admin has added a note to your employment at ${companyName} as ${position}.`;
+      }
+
+      if (notificationMessage) {
+        await pool.query(
+          `INSERT INTO notifications (user_id, type, title, message, link, created_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())`,
+          [
+            candidateUserId,
+            notificationType,
+            notificationTitle,
+            notificationMessage,
+            '/verifications' // Link to verifications page
+          ]
+        );
+      }
     }
 
     res.json({
@@ -838,6 +891,21 @@ router.put('/companies/:id', async (req, res, next) => {
     const { id } = req.params;
     const { name, industry, location, verificationStatus } = req.body;
 
+    // First get the current company record to check for changes
+    const currentRecord = await pool.query(
+      `SELECT c.*, c.user_id
+       FROM companies c
+       WHERE c.id = $1`,
+      [id]
+    );
+
+    if (currentRecord.rows.length === 0) {
+      return next(new AppError('Company not found', 404));
+    }
+
+    const previousRecord = currentRecord.rows[0];
+    const companyUserId = previousRecord.user_id;
+
     const result = await pool.query(
       `UPDATE companies 
        SET name = $1,
@@ -853,6 +921,31 @@ router.put('/companies/:id', async (req, res, next) => {
 
     if (result.rows.length === 0) {
       return next(new AppError('Company not found', 404));
+    }
+
+    // Create notification if status changed
+    const statusChanged = previousRecord.verification_status !== verificationStatus;
+
+    if (companyUserId && statusChanged) {
+      const statusLabels = {
+        'verified': 'Verified',
+        'rejected': 'Rejected',
+        'pending': 'Under Review'
+      };
+      const notificationTitle = `Company Verification ${statusLabels[verificationStatus] || 'Updated'}`;
+      const notificationMessage = `Your company "${name}" verification status has been ${statusLabels[verificationStatus]?.toLowerCase() || 'updated'}.`;
+
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, title, message, link, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [
+          companyUserId,
+          'verification_update',
+          notificationTitle,
+          notificationMessage,
+          '/profile/company/edit' // Link to company profile
+        ]
+      );
     }
 
     res.json({
@@ -901,16 +994,18 @@ router.get('/users', async (req, res, next) => {
     // Get users
     const usersQuery = `
       SELECT 
-        id, 
-        email, 
-        name, 
-        account_type, 
-        is_verified, 
-        created_at,
-        updated_at
-      FROM users 
+        u.id, 
+        u.email, 
+        u.name, 
+        u.account_type, 
+        u.is_verified, 
+        u.created_at,
+        u.updated_at,
+        c.slug as company_slug
+      FROM users u
+      LEFT JOIN companies c ON u.id = c.user_id AND u.account_type = 'company'
       ${whereClause}
-      ORDER BY created_at DESC
+      ORDER BY u.created_at DESC
       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
     `;
     
