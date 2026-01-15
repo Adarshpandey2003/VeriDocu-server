@@ -278,16 +278,28 @@ router.put('/profile', protect, async (req, res, next) => {
 // @access  Public
 router.get('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query(
+    // Try to fetch by candidate ID first, then by user ID
+    let result = await pool.query(
       `SELECT c.*, u.name as username, u.email
        FROM candidates c
        JOIN users u ON c.user_id = u.id
-       WHERE c.id = $1 AND c.is_public = true`,
+       WHERE c.id = $1`,
       [req.params.id]
     );
 
+    // If not found by candidate ID, try user ID
     if (result.rows.length === 0) {
-      return next(new AppError('Candidate profile not found or not public', 404));
+      result = await pool.query(
+        `SELECT c.*, u.name as username, u.email
+         FROM candidates c
+         JOIN users u ON c.user_id = u.id
+         WHERE c.user_id = $1`,
+        [req.params.id]
+      );
+    }
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Candidate profile not found', 404));
     }
 
     // Fetch employment history with company details
