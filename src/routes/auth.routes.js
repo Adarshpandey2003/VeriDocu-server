@@ -1,11 +1,74 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { body, validationResult } from 'express-validator';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { protect } from '../middleware/auth.js';
 import { sendOtpEmail } from '../utils/mailer.js';
+import passport from '../config/passport.js';
+
+// Temporary in-memory store for OAuth authorization codes
+// In production, use Redis or database with TTL
+const authCodeStore = new Map();
+
+// Temporary store for Google profile data (for new user registration)
+const googleProfileStore = new Map();
+
+function storeAuthCode(code, userId, userData) {
+  authCodeStore.set(code, {
+    userId,
+    userData,
+    expiresAt: Date.now() + 5 * 60 * 1000 // 5 minutes TTL
+  });
+  
+  // Auto-cleanup after TTL
+  setTimeout(() => authCodeStore.delete(code), 5 * 60 * 1000);
+}
+
+function storeGoogleProfile(code, profileData) {
+  googleProfileStore.set(code, {
+    profileData,
+    expiresAt: Date.now() + 10 * 60 * 1000 // 10 minutes TTL for profile completion
+  });
+  
+  // Auto-cleanup after TTL
+  setTimeout(() => googleProfileStore.delete(code), 10 * 60 * 1000);
+}
+
+function retrieveGoogleProfile(code) {
+  const data = googleProfileStore.get(code);
+  if (!data) return null;
+  
+  // Check if expired
+  if (Date.now() > data.expiresAt) {
+    googleProfileStore.delete(code);
+    return null;
+  }
+  
+  // Don't delete yet - user might need to retry form
+  return data.profileData;
+}
+
+function deleteGoogleProfile(code) {
+  googleProfileStore.delete(code);
+}
+
+function retrieveAuthCode(code) {
+  const data = authCodeStore.get(code);
+  if (!data) return null;
+  
+  // Check if expired
+  if (Date.now() > data.expiresAt) {
+    authCodeStore.delete(code);
+    return null;
+  }
+  
+  // Delete after retrieval (one-time use)
+  authCodeStore.delete(code);
+  return data;
+}
 
 console.log('🔥🔥🔥 AUTH ROUTES MODULE LOADED 🔥🔥🔥');
 
@@ -256,9 +319,10 @@ router.post('/otp/verify', async (req, res, next) => {
   }
 });
 
-// Generate JWT token
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
+// Generate JWT token with optional user data
+const generateToken = (id, extraClaims = {}) => {
+  const payload = { id, ...extraClaims };
+  return jwt.sign(payload, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || '7d',
   });
 };
@@ -841,5 +905,240 @@ router.post('/reset-password', [
     next(error);
   }
 });
+
+// ===== Google OAuth Routes =====
+
+// Initiate Google OAuth flow
+router.get('/google',
+  passport.authenticate('google', {
+    scope: ['profile', 'email'],
+    session: false
+  })
+);
+
+// Google OAuth callback - generates auth code instead of JWT
+router.get('/google/callback',
+  (req, res, next) => {
+    passport.authenticate('google', { 
+      failureRedirect: `${process.env.CLIENT_URL || 'http://localhost:3000'}/auth/login?error=google_auth_failed`,
+      session: false 
+    }, (err, user, info) => {
+      if (err) {
+        console.error('Passport authentication error:', err);
+        return res.redirect(`${process.env.CLIENT_URL || 'http://localhost:3000'}/auth/login?error=passport_error`);
+      }
+      
+      if (!user) {
+        console.error('No user returned from passport');
+        return res.redirect(`${process.env.CLIENT_URL || 'http://localhost:3000'}/auth/login?error=no_user`);
+      }
+      
+      req.user = user;
+      next();
+    })(req, res, next);
+  },
+  async (req, res) => {
+    try {
+      const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+      
+      // Check if this is a new user who needs to complete registration
+      if (req.user.isNewUser) {
+        // Generate code for profile completion
+        const profileCode = crypto.randomBytes(32).toString('hex');
+        
+        // Store Google profile data
+        storeGoogleProfile(profileCode, {
+          googleId: req.user.googleId,
+          email: req.user.email,
+          name: req.user.name,
+          profilePicture: req.user.profilePicture
+        });
+        
+        // Redirect to profile completion page
+        return res.redirect(`${clientUrl}/auth/complete-profile?code=${profileCode}`);
+      }
+      
+      // Existing user - generate auth code
+      const authCode = crypto.randomBytes(32).toString('hex');
+      
+      // Store auth code with user data temporarily (5 min TTL)
+      storeAuthCode(authCode, req.user.id, {
+        email: req.user.email,
+        accountType: req.user.account_type || req.user.accountType || 'candidate'
+      });
+
+      // Redirect to frontend with authorization code (not JWT)
+      res.redirect(`${clientUrl}/auth/callback?code=${authCode}`);
+    } catch (error) {
+      console.error('Google OAuth callback error:', error);
+      const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+      res.redirect(`${clientUrl}/auth/login?error=auth_failed`);
+    }
+  }
+);
+
+// Exchange authorization code for JWT token
+router.post('/google/exchange',
+  [
+    body('code').notEmpty().withMessage('Authorization code is required')
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { code } = req.body;
+
+      // Retrieve and validate auth code
+      const authData = retrieveAuthCode(code);
+      
+      if (!authData) {
+        return next(new AppError('Invalid or expired authorization code', 400));
+      }
+
+      // Fetch fresh user data from database
+      const userResult = await pool.query(
+        'SELECT id, email, account_type, name FROM users WHERE id = $1',
+        [authData.userId]
+      );
+
+      if (userResult.rows.length === 0) {
+        return next(new AppError('User not found', 404));
+      }
+
+      const user = userResult.rows[0];
+
+      // Generate JWT token using the helper with consistent structure
+      const token = generateToken(user.id, {
+        email: user.email,
+        accountType: user.account_type || 'candidate'
+      });
+
+      // Return token and user data via POST response
+      res.json({
+        success: true,
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          accountType: user.account_type,
+          name: user.name,
+          role: user.account_type
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Complete Google OAuth registration for new users
+router.post('/google/complete-registration',
+  [
+    body('code').notEmpty().withMessage('Profile code is required'),
+    body('accountType').isIn(['candidate', 'company']).withMessage('Account type must be candidate or company'),
+    body('name').optional().trim()
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { code, accountType, name } = req.body;
+
+      // Retrieve Google profile data
+      const profileData = retrieveGoogleProfile(code);
+      
+      if (!profileData) {
+        return next(new AppError('Invalid or expired profile code', 400));
+      }
+
+      // Use provided name or fallback to Google name
+      const userName = name && name.trim() ? name.trim() : profileData.name;
+
+      // Check if user with this email already exists
+      const existingUser = await pool.query(
+        'SELECT id FROM users WHERE email = $1',
+        [profileData.email]
+      );
+
+      if (existingUser.rows.length > 0) {
+        deleteGoogleProfile(code);
+        return next(new AppError('User with this email already exists', 409));
+      }
+
+      // Create user (with null password for OAuth-only users)
+      let insertResult;
+      try {
+        insertResult = await pool.query(
+          `INSERT INTO users (email, google_id, name, profile_picture, account_type, is_verified, password, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           RETURNING *`,
+          [
+            profileData.email,
+            profileData.googleId,
+            userName,
+            profileData.profilePicture,
+            accountType,
+            true,
+            null
+          ]
+        );
+      } catch (error) {
+        // Handle race condition on email uniqueness
+        if (error.code === '23505' || error.constraint === 'users_email_key') {
+          deleteGoogleProfile(code);
+          return next(new AppError('User with this email already exists', 409));
+        }
+        throw error;
+      }
+
+      const newUser = insertResult.rows[0];
+
+      // Create profile based on account type
+      if (accountType === 'candidate') {
+        await pool.query(
+          'INSERT INTO candidates (user_id, full_name, avatar_url, created_at) VALUES ($1, $2, $3, NOW())',
+          [newUser.id, userName, profileData.profilePicture]
+        );
+      } else if (accountType === 'company') {
+        // Create company profile with basic info
+        const companySlug = userName.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now();
+        await pool.query(
+          'INSERT INTO companies (user_id, name, slug, logo_url, created_at) VALUES ($1, $2, $3, $4, NOW())',
+          [newUser.id, userName, companySlug, profileData.profilePicture]
+        );
+      }
+
+      // Delete the profile code after successful registration
+      deleteGoogleProfile(code);
+
+      // Generate JWT token
+      const token = generateToken(newUser.id, {
+        email: newUser.email,
+        accountType: newUser.account_type
+      });
+
+      // Return token and user data
+      res.json({
+        success: true,
+        token,
+        user: {
+          id: newUser.id,
+          email: newUser.email,
+          accountType: newUser.account_type,
+          name: newUser.name,
+          role: newUser.account_type
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 export default router;

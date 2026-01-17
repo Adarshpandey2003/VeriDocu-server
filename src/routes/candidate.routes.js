@@ -174,63 +174,76 @@ router.put('/profile', protect, async (req, res, next) => {
 
     const candidateId = result.rows[0].id;
 
-    // Handle employment history
-    if (experiences && Array.isArray(experiences)) {
-      // Delete existing employment records
-      await pool.query('DELETE FROM employment_history WHERE candidate_id = $1', [candidateId]);
+    // Handle employment and education history atomically
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-      // Insert new employment records
-      for (const exp of experiences) {
-        if (exp.job_title && exp.description) {
-          // Convert month format to date format
-          const startDate = exp.start_month ? `${exp.start_month}-01` : null;
-          const endDate = exp.end_month ? `${exp.end_month}-01` : null;
+      // Handle employment history
+      if (experiences && Array.isArray(experiences)) {
+        // Delete existing employment records
+        await client.query('DELETE FROM employment_history WHERE candidate_id = $1', [candidateId]);
 
-          await pool.query(
-            `INSERT INTO employment_history (candidate_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
-            [
-              candidateId,
-              exp.company || null,
-              exp.job_title,
-              exp.location || null,
-              startDate,
-              endDate,
-              exp.is_current || false,
-              exp.description
-            ]
-          );
+        // Insert new employment records
+        for (const exp of experiences) {
+          if (exp.job_title && exp.description) {
+            // Convert month format to date format
+            const startDate = exp.start_month ? `${exp.start_month}-01` : null;
+            const endDate = exp.end_month ? `${exp.end_month}-01` : null;
+
+            await client.query(
+              `INSERT INTO employment_history (candidate_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+              [
+                candidateId,
+                exp.company || null,
+                exp.job_title,
+                exp.location || null,
+                startDate,
+                endDate,
+                exp.is_current || false,
+                exp.description
+              ]
+            );
+          }
         }
       }
-    }
 
-    // Handle education history
-    if (educations && Array.isArray(educations)) {
-      // Delete existing education records
-      await pool.query('DELETE FROM education_history WHERE candidate_id = $1', [candidateId]);
+      // Handle education history
+      if (educations && Array.isArray(educations)) {
+        // Delete existing education records
+        await client.query('DELETE FROM education_history WHERE candidate_id = $1', [candidateId]);
 
-      // Insert new education records
-      for (const ed of educations) {
-        if (ed.institution && ed.degree) {
-          const startDate = ed.start_month ? `${ed.start_month}-01` : null;
-          const endDate = ed.end_month ? `${ed.end_month}-01` : null;
+        // Insert new education records
+        for (const ed of educations) {
+          if (ed.institution && ed.degree) {
+            const startDate = ed.start_month ? `${ed.start_month}-01` : null;
+            const endDate = ed.end_month ? `${ed.end_month}-01` : null;
 
-          await pool.query(
-            `INSERT INTO education_history (candidate_id, institution, degree, field_of_study, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
-            [
-              candidateId,
-              ed.institution,
-              ed.degree,
-              ed.field_of_study || null,
-              startDate,
-              endDate,
-              ed.is_current || false,
-              ed.description || null
-            ]
-          );
+            await client.query(
+              `INSERT INTO education_history (candidate_id, institution, degree, field_of_study, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+              [
+                candidateId,
+                ed.institution,
+                ed.degree,
+                ed.field_of_study || null,
+                startDate,
+                endDate,
+                ed.is_current || false,
+                ed.description || null
+              ]
+            );
+          }
         }
       }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
 
     // Fetch updated employment history for response
@@ -274,16 +287,20 @@ router.put('/profile', protect, async (req, res, next) => {
 });
 
 // @route   GET /api/candidates/:id
-// @desc    Get candidate profile by ID (public profiles only)
+// @desc    Get candidate profile by ID (public profiles or authorized users)
 // @access  Public
 router.get('/:id', async (req, res, next) => {
   try {
+    // Check if user is authorized (authenticated and admin/owner)
+    const isAuthorized = req.user && (req.user.role === 'admin' || req.user.id === req.params.id);
+    const privacyFilter = isAuthorized ? '' : 'AND c.is_public = true';
+
     // Try to fetch by candidate ID first, then by user ID
     let result = await pool.query(
       `SELECT c.*, u.name as username, u.email
        FROM candidates c
        JOIN users u ON c.user_id = u.id
-       WHERE c.id = $1`,
+       WHERE c.id = $1 ${privacyFilter}`,
       [req.params.id]
     );
 
@@ -293,7 +310,7 @@ router.get('/:id', async (req, res, next) => {
         `SELECT c.*, u.name as username, u.email
          FROM candidates c
          JOIN users u ON c.user_id = u.id
-         WHERE c.user_id = $1`,
+         WHERE c.user_id = $1 ${privacyFilter}`,
         [req.params.id]
       );
     }
@@ -301,6 +318,8 @@ router.get('/:id', async (req, res, next) => {
     if (result.rows.length === 0) {
       return next(new AppError('Candidate profile not found', 404));
     }
+
+    const candidateId = result.rows[0].id;
 
     // Fetch employment history with company details
     const employmentResult = await pool.query(
@@ -313,7 +332,7 @@ router.get('/:id', async (req, res, next) => {
        LEFT JOIN companies c ON eh.company_id = c.id
        WHERE eh.candidate_id = $1
        ORDER BY eh.start_date DESC`,
-      [req.params.id]
+      [candidateId]
     );
     
     // Generate signed URLs for company logos
@@ -347,7 +366,7 @@ router.get('/:id', async (req, res, next) => {
        FROM education_history
        WHERE candidate_id = $1
        ORDER BY start_date DESC`,
-      [req.params.id]
+      [candidateId]
     );
 
     // Prefer candidate.full_name, fallback to username
@@ -508,7 +527,16 @@ router.get('/profile/avatar-url', protect, async (req, res, next) => {
 
     const avatarPath = result.rows[0].avatar_url;
 
-    // Generate signed URL
+    // Check if it's an external URL (e.g., Google profile picture)
+    if (avatarPath.startsWith('http://') || avatarPath.startsWith('https://')) {
+      // Return the external URL directly with consistent property name
+      return res.json({
+        success: true,
+        signedUrl: avatarPath
+      });
+    }
+
+    // Generate signed URL for Supabase storage
     const { data, error } = await getProfilePictureSignedUrl(avatarPath);
 
     if (error) {
@@ -604,75 +632,7 @@ router.get('/profile/cover-image-url', protect, async (req, res, next) => {
   }
 });
 
-// @route   GET /api/candidates/:id
-// @desc    Get candidate profile by ID (public/admin view)
-// @access  Public
-router.get('/:id', async (req, res, next) => {
-  try {
-    const { id } = req.params;
 
-    // First try to find by user_id
-    let result = await pool.query(
-      `SELECT c.*, u.email, u.name as user_name
-       FROM candidates c
-       JOIN users u ON c.user_id = u.id
-       WHERE u.id = $1`,
-      [id]
-    );
-
-    // If not found by user_id, try by candidate_id
-    if (result.rows.length === 0) {
-      result = await pool.query(
-        `SELECT c.*, u.email, u.name as user_name
-         FROM candidates c
-         JOIN users u ON c.user_id = u.id
-         WHERE c.id = $1`,
-        [id]
-      );
-    }
-
-    if (result.rows.length === 0) {
-      return next(new AppError('Candidate not found', 404));
-    }
-
-    // Fetch employment history
-    const employmentResult = await pool.query(
-      `SELECT id, company_name as company, position as job_title, location,
-              TO_CHAR(start_date, 'YYYY-MM') as start_month,
-              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
-              is_current, description, verification_status
-       FROM employment_history
-       WHERE candidate_id = $1
-       ORDER BY start_date DESC`,
-      [result.rows[0].id]
-    );
-
-    // Fetch education history
-    const educationResult = await pool.query(
-      `SELECT id, institution, degree, field_of_study, 
-              TO_CHAR(start_date, 'YYYY-MM') as start_month,
-              CASE WHEN is_current THEN NULL ELSE TO_CHAR(end_date, 'YYYY-MM') END as end_month,
-              is_current, description, verification_status
-       FROM education_history
-       WHERE candidate_id = $1
-       ORDER BY start_date DESC`,
-      [result.rows[0].id]
-    );
-
-    const candidate = {
-      ...result.rows[0],
-      experiences: employmentResult.rows,
-      educations: educationResult.rows
-    };
-
-    res.json({
-      success: true,
-      candidate
-    });
-  } catch (error) {
-    next(error);
-  }
-});
 
 // @route   GET /api/candidates/:id/avatar-url
 // @desc    Get candidate avatar signed URL by ID
@@ -704,7 +664,15 @@ router.get('/:id/avatar-url', async (req, res, next) => {
 
     const avatarPath = result.rows[0].avatar_url;
 
-    // Generate signed URL
+    // Check if it's an external URL (e.g., Google profile picture)
+    if (avatarPath.startsWith('http://') || avatarPath.startsWith('https://')) {
+      return res.json({
+        success: true,
+        signedUrl: avatarPath
+      });
+    }
+
+    // Generate signed URL for Supabase storage
     const { data, error } = await getProfilePictureSignedUrl(avatarPath);
 
     if (error) {

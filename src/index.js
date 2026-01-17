@@ -5,6 +5,7 @@ import compression from 'compression';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import passport from './config/passport.js';
 
 // Load environment variables
 dotenv.config();
@@ -58,6 +59,9 @@ app.use(cors({
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Initialize Passport
+app.use(passport.initialize());
 
 // Compression
 app.use(compression());
