@@ -42,27 +42,48 @@ router.get('/verifications/stats', async (req, res, next) => {
       FROM companies
     `;
 
-    const [employmentStats, companyStats] = await Promise.all([
+    // Get education verification stats
+    const educationStatsQuery = `
+      SELECT 
+        COUNT(*) as total_requests,
+        COUNT(CASE WHEN verification_type = 'manual' THEN 1 END) as total_manual,
+        COUNT(CASE WHEN verification_status = 'pending' THEN 1 END) as pending,
+        COUNT(CASE WHEN verification_status = 'pending' AND verification_type = 'manual' THEN 1 END) as pending_manual,
+        COUNT(CASE WHEN verification_status = 'verified' THEN 1 END) as approved,
+        COUNT(CASE WHEN verification_status = 'verified' AND verification_type = 'manual' THEN 1 END) as approved_manual,
+        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END) as rejected,
+        COUNT(CASE WHEN verification_status = 'rejected' AND verification_type = 'manual' THEN 1 END) as rejected_manual
+      FROM education_history
+    `;
+
+    const [employmentStats, companyStats, educationStats] = await Promise.all([
       pool.query(employmentStatsQuery),
-      pool.query(companyStatsQuery)
+      pool.query(companyStatsQuery),
+      pool.query(educationStatsQuery)
     ]);
 
     const empStats = employmentStats.rows[0];
     const compStats = companyStats.rows[0];
+    const eduStats = educationStats.rows[0];
 
     const stats = {
-      totalRequests: (parseInt(empStats.total_requests) || 0) + (parseInt(compStats.total_companies) || 0),
-      totalManual: parseInt(empStats.total_manual) || 0,
+      totalRequests: (parseInt(empStats.total_requests) || 0) + (parseInt(compStats.total_companies) || 0) + (parseInt(eduStats.total_requests) || 0),
+      totalManual: (parseInt(empStats.total_manual) || 0) + (parseInt(eduStats.total_manual) || 0),
       totalCompanies: parseInt(compStats.total_companies) || 0,
-      pending: (parseInt(empStats.pending) || 0) + (parseInt(compStats.pending_companies) || 0),
+      pending: (parseInt(empStats.pending) || 0) + (parseInt(compStats.pending_companies) || 0) + (parseInt(eduStats.pending) || 0),
       pendingCompanies: parseInt(compStats.pending_companies) || 0,
-      pendingManual: parseInt(empStats.pending_manual) || 0,
-      approved: (parseInt(empStats.approved) || 0) + (parseInt(compStats.approved_companies) || 0),
+      pendingManual: (parseInt(empStats.pending_manual) || 0) + (parseInt(eduStats.pending_manual) || 0),
+      approved: (parseInt(empStats.approved) || 0) + (parseInt(compStats.approved_companies) || 0) + (parseInt(eduStats.approved) || 0),
       approvedCompanies: parseInt(compStats.approved_companies) || 0,
-      approvedManual: parseInt(empStats.approved_manual) || 0,
-      rejected: (parseInt(empStats.rejected) || 0) + (parseInt(compStats.rejected_companies) || 0),
+      approvedManual: (parseInt(empStats.approved_manual) || 0) + (parseInt(eduStats.approved_manual) || 0),
+      rejected: (parseInt(empStats.rejected) || 0) + (parseInt(compStats.rejected_companies) || 0) + (parseInt(eduStats.rejected) || 0),
       rejectedCompanies: parseInt(compStats.rejected_companies) || 0,
-      rejectedManual: parseInt(empStats.rejected_manual) || 0,
+      rejectedManual: (parseInt(empStats.rejected_manual) || 0) + (parseInt(eduStats.rejected_manual) || 0),
+      // Education-specific stats
+      totalEducationRequests: parseInt(eduStats.total_requests) || 0,
+      pendingEducation: parseInt(eduStats.pending) || 0,
+      approvedEducation: parseInt(eduStats.approved) || 0,
+      rejectedEducation: parseInt(eduStats.rejected) || 0,
     };
 
     // Get employment verification list with filters
@@ -800,7 +821,7 @@ router.put('/users/:id/status', async (req, res, next) => {
 router.put('/employments/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { position, companyName, startDate, endDate, verificationStatus, adminNotes } = req.body;
+    const { position, companyName, startDate, endDate, verificationStatus } = req.body;
 
     // First get the current employment record to check for changes and get candidate info
     const currentRecord = await pool.query(
@@ -825,22 +846,20 @@ router.put('/employments/:id', async (req, res, next) => {
            start_date = $3,
            end_date = $4,
            verification_status = $5,
-           notes = $6,
            updated_at = NOW()
-       WHERE id = $7
+       WHERE id = $6
        RETURNING *`,
-      [position, companyName, startDate, endDate, verificationStatus, adminNotes, id]
+      [position, companyName, startDate, endDate, verificationStatus, id]
     );
 
     if (result.rows.length === 0) {
       return next(new AppError('Employment record not found', 404));
     }
 
-    // Create notification if status changed or admin notes were added
+    // Create notification if status changed
     const statusChanged = previousRecord.verification_status !== verificationStatus;
-    const notesAdded = adminNotes && adminNotes !== previousRecord.notes;
 
-    if (candidateUserId && (statusChanged || notesAdded)) {
+    if (candidateUserId && statusChanged) {
       let notificationTitle = '';
       let notificationMessage = '';
       let notificationType = 'verification_update';
@@ -1074,6 +1093,418 @@ router.get('/users/:id', async (req, res, next) => {
     res.json({
       success: true,
       user: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/admin/verifications/:type/:id/comments
+// @desc    Add comment to verification
+// @access  Admin only
+router.post('/verifications/:type/:id/comments', async (req, res, next) => {
+  try {
+    const { type, id } = req.params;
+    const { comment } = req.body;
+
+    if (!comment || !comment.trim()) {
+      return next(new AppError('Comment text is required', 400));
+    }
+
+    if (!['employment', 'company', 'education'].includes(type)) {
+      return next(new AppError('Invalid verification type', 400));
+    }
+
+    // Get admin details
+    const userResult = await pool.query(
+      'SELECT id, name, account_type FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return next(new AppError('User not found', 404));
+    }
+
+    const user = userResult.rows[0];
+
+    // Insert comment
+    const result = await pool.query(
+      `INSERT INTO verification_comments 
+       (verification_type, verification_id, user_id, user_name, user_role, comment_text, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING *`,
+      [type, id, user.id, user.name || 'Admin', user.account_type, comment.trim()]
+    );
+
+    // Get candidate user ID based on verification type
+    let candidateUserId = null;
+    if (type === 'employment') {
+      const empResult = await pool.query(
+        `SELECT c.user_id 
+         FROM employment_history eh
+         JOIN candidates c ON eh.candidate_id = c.id
+         WHERE eh.id = $1`,
+        [id]
+      );
+      if (empResult.rows.length > 0) {
+        candidateUserId = empResult.rows[0].user_id;
+      }
+    } else if (type === 'company') {
+      const compResult = await pool.query(
+        `SELECT c.user_id 
+         FROM company_verifications cv
+         JOIN candidates c ON cv.candidate_id = c.id
+         WHERE cv.id = $1`,
+        [id]
+      );
+      if (compResult.rows.length > 0) {
+        candidateUserId = compResult.rows[0].user_id;
+      }
+    }
+
+    // Create notification for candidate
+    if (candidateUserId) {
+      await pool.query(
+        `INSERT INTO notifications 
+         (user_id, type, title, message, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [
+          candidateUserId,
+          'comment_added',
+          'New Comment from Admin',
+          `Admin has added a comment on your ${type} verification: "${comment.trim().substring(0, 100)}${comment.trim().length > 100 ? '...' : ''}"`
+        ]
+      );
+    }
+
+    res.json({
+      success: true,
+      comment: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/verifications/:type/:id/comments
+// @desc    Get comment history for verification
+// @access  Admin only
+router.get('/verifications/:type/:id/comments', async (req, res, next) => {
+  try {
+    const { type, id } = req.params;
+
+    if (!['employment', 'company', 'education'].includes(type)) {
+      return next(new AppError('Invalid verification type', 400));
+    }
+
+    const result = await pool.query(
+      `SELECT 
+        vc.*,
+        u.email as user_email
+       FROM verification_comments vc
+       LEFT JOIN users u ON vc.user_id = u.id
+       WHERE vc.verification_type = $1 AND vc.verification_id = $2
+       ORDER BY vc.created_at ASC`,
+      [type, id]
+    );
+
+    res.json({
+      success: true,
+      comments: result.rows
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ============= EDUCATION VERIFICATION ROUTES =============
+
+// @route   GET /api/admin/educations
+// @desc    Get all education verifications for admin review
+// @access  Admin only
+router.get('/educations', async (req, res, next) => {
+  try {
+    const { status } = req.query;
+
+    let query = `
+      SELECT 
+        eh.id,
+        eh.candidate_id,
+        eh.institution,
+        eh.degree,
+        eh.field_of_study,
+        eh.start_date,
+        eh.end_date,
+        eh.is_current,
+        eh.verification_status,
+        eh.verification_type,
+        eh.document_url,
+        eh.rejection_reason,
+        eh.verified_at,
+        eh.created_at,
+        c.id as candidate_id,
+        u.id as user_id,
+        u.name as candidate_name,
+        u.email as candidate_email,
+        u.avatar_url
+      FROM education_history eh
+      JOIN candidates c ON eh.candidate_id = c.id
+      JOIN users u ON c.user_id = u.id
+    `;
+
+    const queryParams = [];
+    if (status && status !== 'all') {
+      query += ` WHERE eh.verification_status = $1`;
+      queryParams.push(status);
+    }
+
+    query += ` ORDER BY eh.created_at DESC`;
+
+    const result = await pool.query(query, queryParams);
+
+    // Generate signed URLs for documents and avatars
+    const educations = await Promise.all(result.rows.map(async (row) => {
+      let documentUrl = row.document_url;
+      let avatarUrl = row.avatar_url;
+
+      // Generate signed URL for document
+      if (documentUrl) {
+        try {
+          const urlParts = documentUrl.split('/VeriBoard_bucket/');
+          let filePath = documentUrl;
+          if (urlParts.length >= 2) {
+            filePath = urlParts[1];
+          }
+          
+          const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+          if (!error && data?.signedUrl) {
+            documentUrl = data.signedUrl;
+          }
+        } catch (err) {
+          console.error('Error generating signed URL for education document:', err);
+        }
+      }
+
+      // Generate signed URL for avatar
+      if (avatarUrl) {
+        try {
+          const urlParts = avatarUrl.split('/VeriBoard_bucket/');
+          let filePath = avatarUrl;
+          if (urlParts.length >= 2) {
+            filePath = urlParts[1];
+          }
+          
+          const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+          if (!error && data?.signedUrl) {
+            avatarUrl = data.signedUrl;
+          }
+        } catch (err) {
+          console.error('Error generating signed URL for avatar:', err);
+        }
+      }
+
+      return {
+        id: row.id,
+        candidateId: row.candidate_id,
+        candidateName: row.candidate_name,
+        candidateEmail: row.candidate_email,
+        institutionName: row.institution_name,
+        degree: row.degree,
+        fieldOfStudy: row.field_of_study,
+        startDate: row.start_date,
+        endDate: row.end_date,
+        isCurrent: row.is_current,
+        verificationStatus: row.verification_status || 'pending',
+        verificationType: row.verification_type || 'manual',
+        rejectionReason: row.rejection_reason,
+        verifiedAt: row.verified_at,
+        createdAt: row.created_at,
+        documentUrl,
+        avatarUrl,
+      };
+    }));
+
+    res.json({
+      success: true,
+      educations,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/educations/:id
+// @desc    Get single education verification details
+// @access  Admin only
+router.get('/educations/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(`
+      SELECT 
+        eh.*,
+        c.id as candidate_id,
+        u.id as user_id,
+        u.name as candidate_name,
+        u.email as candidate_email,
+        u.avatar_url
+      FROM education_history eh
+      JOIN candidates c ON eh.candidate_id = c.id
+      JOIN users u ON c.user_id = u.id
+      WHERE eh.id = $1
+    `, [id]);
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Education record not found', 404));
+    }
+
+    const education = result.rows[0];
+
+    // Generate signed URL for document
+    let documentUrl = education.document_url;
+    if (documentUrl) {
+      try {
+        const urlParts = documentUrl.split('/VeriBoard_bucket/');
+        let filePath = documentUrl;
+        if (urlParts.length >= 2) {
+          filePath = urlParts[1];
+        }
+        
+        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
+        if (!error && data?.signedUrl) {
+          documentUrl = data.signedUrl;
+        }
+      } catch (err) {
+        console.error('Error generating signed URL:', err);
+      }
+    }
+
+    res.json({
+      success: true,
+      education: {
+        ...education,
+        documentUrl
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/admin/educations/:id/document
+// @desc    Get education verification document with signed URL
+// @access  Admin only
+router.get('/educations/:id/document', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      'SELECT document_url FROM education_history WHERE id = $1',
+      [id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].document_url) {
+      return next(new AppError('Document not found', 404));
+    }
+
+    const documentUrl = result.rows[0].document_url;
+    const urlParts = documentUrl.split('/VeriBoard_bucket/');
+    
+    if (urlParts.length < 2) {
+      return next(new AppError('Invalid document URL format', 400));
+    }
+
+    const filePath = urlParts[1];
+    const { data, error } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .createSignedUrl(filePath, 3600);
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return next(new AppError('Failed to generate document access URL', 500));
+    }
+
+    res.json({ url: data.signedUrl });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   PUT /api/admin/educations/:id
+// @desc    Update education verification record
+// @access  Admin only
+router.put('/educations/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { institutionName, degree, fieldOfStudy, startDate, endDate, verificationStatus, rejectionReason } = req.body;
+
+    // First get the current education record to check for changes and get candidate info
+    const currentRecord = await pool.query(
+      `SELECT eh.*, c.user_id as candidate_user_id
+       FROM education_history eh
+       JOIN candidates c ON eh.candidate_id = c.id
+       WHERE eh.id = $1`,
+      [id]
+    );
+
+    if (currentRecord.rows.length === 0) {
+      return next(new AppError('Education record not found', 404));
+    }
+
+    const previousRecord = currentRecord.rows[0];
+    const candidateUserId = previousRecord.candidate_user_id;
+    const statusChanged = previousRecord.verification_status !== verificationStatus;
+
+    // Update education record
+    const result = await pool.query(
+      `UPDATE education_history 
+       SET institution_name = $1,
+           degree = $2,
+           field_of_study = $3,
+           start_date = $4,
+           end_date = $5,
+           verification_status = $6,
+           rejection_reason = $7,
+           verified_by = $8,
+           verified_at = CASE WHEN $6 = 'verified' THEN NOW() ELSE verified_at END,
+           updated_at = NOW()
+       WHERE id = $9
+       RETURNING *`,
+      [institutionName, degree, fieldOfStudy, startDate, endDate, verificationStatus, rejectionReason, req.user.id, id]
+    );
+
+    if (result.rows.length === 0) {
+      return next(new AppError('Education record not found', 404));
+    }
+
+    // Create notification if status changed
+    if (candidateUserId && statusChanged) {
+      const statusLabels = {
+        'verified': 'Verified',
+        'rejected': 'Rejected',
+        'pending': 'Under Review'
+      };
+      
+      const notificationTitle = `Education Verification ${statusLabels[verificationStatus] || 'Updated'}`;
+      const notificationMessage = `Your education at ${institutionName} (${degree}) has been ${statusLabels[verificationStatus]?.toLowerCase() || 'updated'}.`;
+
+      await pool.query(
+        `INSERT INTO notifications (user_id, type, title, message, link, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [
+          candidateUserId,
+          'verification_update',
+          notificationTitle,
+          notificationMessage,
+          '/education-verifications'
+        ]
+      );
+    }
+
+    res.json({
+      success: true,
+      message: 'Education verification updated successfully',
+      education: result.rows[0],
     });
   } catch (error) {
     next(error);

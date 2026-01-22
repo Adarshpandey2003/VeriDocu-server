@@ -108,6 +108,9 @@ router.get('/profile', protect, async (req, res, next) => {
       profile.cover_image_url = await getSignedImageUrl(profile.cover_image_url);
     }
 
+    // Check if company is verified
+    profile.isVerified = profile.verification_status === 'verified';
+
     res.json({
       success: true,
       profile
@@ -335,6 +338,9 @@ router.get('/:slug', async (req, res, next) => {
     } catch (err) {
       console.warn('Failed to generate signed URL for cover image:', err);
     }
+
+    // Check if company is verified
+    companyRow.isVerified = companyRow.verification_status === 'verified';
 
     res.json({
       success: true,

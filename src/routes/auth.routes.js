@@ -548,6 +548,11 @@ router.post(
 
       const user = result.rows[0];
 
+      // Check if user has a password (OAuth-only users have NULL password)
+      if (!user.password_value) {
+        return next(new AppError('This account uses Google sign-in. Please log in with Google.', 401));
+      }
+
       // Check password against stored password field (aliased to password_value)
       const isMatch = await bcrypt.compare(password, user.password_value);
       if (!isMatch) {

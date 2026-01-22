@@ -372,4 +372,209 @@ router.post('/employment-verification', protect, authorize('candidate'), upload.
   }
 });
 
+// ============= EDUCATION VERIFICATION ROUTES =============
+
+// Get candidate's education history with verification status
+router.get('/education-history', protect, authorize('candidate'), async (req, res) => {
+  try {
+    // First get the candidate ID from user ID
+    let candidateResult = await pool.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    // Auto-create candidate profile if it doesn't exist
+    if (candidateResult.rows.length === 0) {
+      const createResult = await pool.query(
+        'INSERT INTO candidates (user_id, created_at, updated_at) VALUES ($1, NOW(), NOW()) RETURNING id',
+        [req.user.id]
+      );
+      candidateResult = createResult;
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
+    const result = await pool.query(`
+      SELECT 
+        id,
+        candidate_id,
+        institution_name,
+        degree,
+        field_of_study,
+        start_date,
+        end_date,
+        is_current,
+        grade,
+        description,
+        verification_status,
+        verification_type,
+        document_url,
+        rejection_reason,
+        verified_at,
+        created_at
+      FROM education_history
+      WHERE candidate_id = $1
+      ORDER BY start_date DESC
+    `, [candidateId]);
+
+    const educations = result.rows.map(row => ({
+      id: row.id,
+      institutionName: row.institution_name,
+      degree: row.degree,
+      fieldOfStudy: row.field_of_study,
+      startDate: row.start_date,
+      endDate: row.end_date,
+      isCurrent: row.is_current,
+      grade: row.grade,
+      description: row.description,
+      verificationStatus: row.verification_status,
+      verificationType: row.verification_type,
+      documentUrl: row.document_url,
+      rejectionReason: row.rejection_reason,
+      verifiedAt: row.verified_at,
+      createdAt: row.created_at
+    }));
+
+    res.json({ educations });
+  } catch (error) {
+    console.error('Error fetching education history:', error);
+    res.status(500).json({ message: 'Failed to fetch education history' });
+  }
+});
+
+// Update education with verification document
+router.post('/education-verification/update', protect, authorize('candidate'), upload.single('document'), async (req, res) => {
+  try {
+    const { educationId, verificationType } = req.body;
+
+    if (!educationId) {
+      return res.status(400).json({ message: 'Education ID is required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'Verification document is required' });
+    }
+
+    // Get candidate_id from user_id
+    const candidateResult = await pool.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (candidateResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Candidate profile not found' });
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
+    // Verify the education belongs to this candidate
+    const educationCheck = await pool.query(
+      'SELECT id FROM education_history WHERE id = $1 AND candidate_id = $2',
+      [educationId, candidateId]
+    );
+
+    if (educationCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Education record not found or access denied' });
+    }
+
+    // Upload to Supabase Storage
+    const fileExt = path.extname(req.file.originalname);
+    const fileName = `candidate-${candidateId}-edu-${Date.now()}${fileExt}`;
+    const filePath = `verification_docs/education-verifications/${fileName}`;
+
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false
+      });
+
+    if (uploadError) {
+      console.error('Supabase upload error:', uploadError);
+      return res.status(500).json({ message: 'Failed to upload document' });
+    }
+
+    // Get public URL
+    const { data: { publicUrl } } = supabase.storage
+      .from('VeriBoard_bucket')
+      .getPublicUrl(filePath);
+
+    // Determine verification status
+    const verificationStatus = verificationType === 'manual' ? 'pending' : 'in_review';
+
+    // Update education record
+    const updateResult = await pool.query(`
+      UPDATE education_history 
+      SET 
+        document_url = $1,
+        verification_status = $2,
+        verification_type = $3,
+        updated_at = NOW()
+      WHERE id = $4 AND candidate_id = $5
+      RETURNING *
+    `, [publicUrl, verificationStatus, verificationType || 'auto', educationId, candidateId]);
+
+    res.json({
+      message: 'Verification document uploaded successfully',
+      education: updateResult.rows[0]
+    });
+  } catch (error) {
+    console.error('Error updating education verification:', error);
+    res.status(500).json({ message: 'Failed to upload verification document' });
+  }
+});
+
+// Get signed URL for education document
+router.get('/education-document/:educationId', protect, authorize('candidate'), async (req, res) => {
+  try {
+    const { educationId } = req.params;
+
+    // Get candidate_id from user_id
+    const candidateResult = await pool.query(
+      'SELECT id FROM candidates WHERE user_id = $1',
+      [req.user.id]
+    );
+
+    if (candidateResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Candidate profile not found' });
+    }
+
+    const candidateId = candidateResult.rows[0].id;
+
+    // Get education document URL
+    const educationResult = await pool.query(
+      'SELECT document_url FROM education_history WHERE id = $1 AND candidate_id = $2',
+      [educationId, candidateId]
+    );
+
+    if (educationResult.rows.length === 0 || !educationResult.rows[0].document_url) {
+      return res.status(404).json({ message: 'Document not found' });
+    }
+
+    const documentUrl = educationResult.rows[0].document_url;
+
+    // Extract file path from public URL
+    const urlParts = documentUrl.split('/VeriBoard_bucket/');
+    if (urlParts.length < 2) {
+      return res.status(400).json({ message: 'Invalid document URL format' });
+    }
+    const filePath = urlParts[1];
+
+    // Generate signed URL (valid for 1 hour)
+    const { data, error } = await supabase.storage
+      .from('VeriBoard_bucket')
+      .createSignedUrl(filePath, 3600);
+
+    if (error) {
+      console.error('Error creating signed URL:', error);
+      return res.status(500).json({ message: 'Failed to generate document access URL' });
+    }
+
+    res.json({ url: data.signedUrl });
+  } catch (error) {
+    console.error('Error getting education document:', error);
+    res.status(500).json({ message: 'Failed to retrieve document' });
+  }
+});
+
 export default router;

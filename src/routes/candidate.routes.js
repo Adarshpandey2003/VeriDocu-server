@@ -77,6 +77,11 @@ router.get('/profile', protect, async (req, res, next) => {
       [result.rows[0].id]
     );
     
+    // Check if any employment is verified
+    const hasVerifiedEmployment = employmentResult.rows.some(
+      exp => exp.verification_status === 'verified'
+    );
+    
     // Generate signed URLs for company logos
     const experiencesWithLogos = await Promise.all(
       employmentResult.rows.map(async (exp) => {
@@ -114,7 +119,8 @@ router.get('/profile', protect, async (req, res, next) => {
     const profile = {
       ...result.rows[0],
       experiences: experiencesWithLogos,
-      educations: educationResult.rows
+      educations: educationResult.rows,
+      hasVerifiedEmployment
     };
 
     res.json({
@@ -335,6 +341,11 @@ router.get('/:id', async (req, res, next) => {
       [candidateId]
     );
     
+    // Check if any employment is verified
+    const hasVerifiedEmployment = employmentResult.rows.some(
+      exp => exp.verification_status === 'verified'
+    );
+    
     // Generate signed URLs for company logos
     const experiencesWithLogos = await Promise.all(
       employmentResult.rows.map(async (exp) => {
@@ -375,7 +386,8 @@ router.get('/:id', async (req, res, next) => {
       ...row,
       name: row.full_name || row.username || null,
       experiences: experiencesWithLogos,
-      educations: educationResult.rows
+      educations: educationResult.rows,
+      hasVerifiedEmployment
     };
 
     res.json({
@@ -726,6 +738,108 @@ router.get('/:id/cover-image-url', async (req, res, next) => {
     res.json({
       success: true,
       signedUrl: data.signedUrl
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/candidates/employments/:id/comments
+// @desc    Get comment history for an employment verification
+// @access  Private (Candidate only - own verifications)
+router.get('/employments/:id/comments', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    const { id } = req.params;
+
+    // Verify the employment belongs to the current candidate
+    const employmentCheck = await pool.query(
+      `SELECT eh.id FROM employment_history eh
+       JOIN candidates c ON eh.candidate_id = c.id
+       WHERE eh.id = $1 AND c.user_id = $2`,
+      [id, req.user.id]
+    );
+
+    if (employmentCheck.rows.length === 0) {
+      return next(new AppError('Employment verification not found or access denied', 404));
+    }
+
+    // Get comments
+    const result = await pool.query(
+      `SELECT 
+        vc.*,
+        u.email as user_email
+       FROM verification_comments vc
+       LEFT JOIN users u ON vc.user_id = u.id
+       WHERE vc.verification_type = 'employment' AND vc.verification_id = $1
+       ORDER BY vc.created_at ASC`,
+      [id]
+    );
+
+    res.json({
+      success: true,
+      comments: result.rows
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/candidates/employments/:id/comments
+// @desc    Add a comment to an employment verification
+// @access  Private (Candidate only - own verifications)
+router.post('/employments/:id/comments', protect, async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return next(new AppError('Access denied. Candidates only.', 403));
+    }
+
+    const { id } = req.params;
+    const { comment } = req.body;
+
+    if (!comment || !comment.trim()) {
+      return next(new AppError('Comment text is required', 400));
+    }
+
+    // Verify the employment belongs to the current candidate
+    const employmentCheck = await pool.query(
+      `SELECT eh.id, c.user_id FROM employment_history eh
+       JOIN candidates c ON eh.candidate_id = c.id
+       WHERE eh.id = $1 AND c.user_id = $2`,
+      [id, req.user.id]
+    );
+
+    if (employmentCheck.rows.length === 0) {
+      return next(new AppError('Employment verification not found or access denied', 404));
+    }
+
+    // Get user details
+    const userResult = await pool.query(
+      'SELECT id, name, account_type FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return next(new AppError('User not found', 404));
+    }
+
+    const user = userResult.rows[0];
+
+    // Insert comment
+    const result = await pool.query(
+      `INSERT INTO verification_comments 
+       (verification_type, verification_id, user_id, user_name, user_role, comment_text, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING *`,
+      ['employment', id, user.id, user.name || 'Candidate', user.account_type, comment.trim()]
+    );
+
+    res.json({
+      success: true,
+      comment: result.rows[0]
     });
   } catch (error) {
     next(error);
