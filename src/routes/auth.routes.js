@@ -13,6 +13,27 @@ import passport from '../config/passport.js';
 // In production, use Redis or database with TTL
 const authCodeStore = new Map();
 
+// Server-side store for pending registration data (avoids sending bcrypt hash to client)
+const pendingRegistrations = new Map();
+
+function storePendingRegistration(email, data) {
+  const key = email.toLowerCase();
+  pendingRegistrations.set(key, { data, expiresAt: Date.now() + 10 * 60 * 1000 });
+  setTimeout(() => pendingRegistrations.delete(key), 10 * 60 * 1000);
+}
+
+function retrievePendingRegistration(email) {
+  const key = email.toLowerCase();
+  const entry = pendingRegistrations.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { pendingRegistrations.delete(key); return null; }
+  return entry.data;
+}
+
+function deletePendingRegistration(email) {
+  pendingRegistrations.delete(email.toLowerCase());
+}
+
 // Temporary store for Google profile data (for new user registration)
 const googleProfileStore = new Map();
 
@@ -70,7 +91,7 @@ function retrieveAuthCode(code) {
   return data;
 }
 
-console.log('🔥🔥🔥 AUTH ROUTES MODULE LOADED 🔥🔥🔥');
+if (process.env.NODE_ENV !== 'production') console.log('🔥 Auth routes loaded');
 
 // Use global fetch (Node 18+) to call Google reCAPTCHA verify endpoint. If your Node runtime
 // does not include global fetch, install node-fetch and import it here.
@@ -211,12 +232,9 @@ router.post('/otp/request', async (req, res, next) => {
       [normEmail, code, purpose]
     );
 
-    console.log(`[OTP] ═══════════════════════════════════════════════════════`);
-    console.log(`[OTP] 📧 Recipient: ${email}`);
-    console.log(`[OTP] 🔐 Code: ${code}`);
-    console.log(`[OTP] 📝 Purpose: ${purpose}`);
-    console.log(`[OTP] ⏰ Expires: 10 minutes`);
-    console.log(`[OTP] ═══════════════════════════════════════════════════════`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[OTP] Recipient: ${email} | Purpose: ${purpose} | Code: ${code}`);
+    }
 
     // Send via email (await to catch errors immediately)
     let emailSent = false;
@@ -383,11 +401,9 @@ router.post(
         [email, code, 'register']
       );
 
-      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
-      console.log(`[AUTH] 📧 Registration OTP for: ${email}`);
-      console.log(`[AUTH] 🔐 Verification Code: ${code}`);
-      console.log(`[AUTH] ⏰ Expires in: 10 minutes`);
-      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[AUTH] Registration OTP for: ${email} | Code: ${code}`);
+      }
 
       // Send verification email
       try {
@@ -406,9 +422,9 @@ router.post(
         console.error('[AUTH] ❌ Error sending registration OTP:', err.message || err);
       }
 
-      // Return success with OTP requirement and registration data
-      console.log(`[AUTH] ✅ Registration OTP sent, requiresVerification=true`);
-      
+      // Return success with OTP requirement; keep registration data server-side
+      storePendingRegistration(email, { name, hashedPassword, accountType, companyName });
+
       res.status(201).json({
         success: true,
         message: 'Verification code sent to your email. Please verify to complete registration.',
@@ -416,7 +432,6 @@ router.post(
         email: email,
         registrationData: {
           name,
-          hashedPassword,
           accountType,
           companyName,
         },
@@ -437,8 +452,12 @@ router.post('/verify-email', async (req, res, next) => {
       return next(new AppError('Email and verification code are required', 400));
     }
 
-    if (!registrationData || !registrationData.name || !registrationData.hashedPassword || !registrationData.accountType) {
-      return next(new AppError('Registration data is required', 400));
+    // Prefer server-side store; fall back to request body for backward compat
+    const serverRegData = retrievePendingRegistration(email);
+    const effectiveRegData = serverRegData || registrationData;
+
+    if (!effectiveRegData?.name || !effectiveRegData?.hashedPassword || !effectiveRegData?.accountType) {
+      return next(new AppError('Registration data not found. Please register again.', 400));
     }
 
     // Check if code is valid - NO NORMALIZATION
@@ -451,8 +470,9 @@ router.post('/verify-email', async (req, res, next) => {
       return next(new AppError('Invalid or expired verification code', 400));
     }
 
-    // Delete used code
+    // Delete used code and pending registration data
     await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, 'register']);
+    deletePendingRegistration(email);
 
     // Check if user already exists (edge case: created between register and verify)
     const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
@@ -461,7 +481,7 @@ router.post('/verify-email', async (req, res, next) => {
     }
 
     // Now create the user account
-    const { name, hashedPassword, accountType, companyName } = registrationData;
+    const { name, hashedPassword, accountType, companyName } = effectiveRegData;
     
     // Create user - insert name into users table along with other data
     const pwColCreate = await detectPasswordColumn() || 'password_hash';
@@ -561,16 +581,11 @@ router.post(
 
       // If OTP-on-login is enabled, send a one-time code and require verification
       const enableOtpOnLogin = process.env.ENABLE_OTP_ON_LOGIN === 'true';
-      console.log('🔐 OTP on login enabled:', enableOtpOnLogin); // Debug log
       if (enableOtpOnLogin) {
-    // OTP-on-login is enabled
         const code = generateOtpCode();
-        
-        console.log(`\n[AUTH] ═══════════════════════════════════════════════════════`);
-        console.log(`[AUTH] 📧 Generating NEW login OTP for: ${email}`);
-        console.log(`[AUTH] 🔐 Code: ${code}`);
-        console.log(`[AUTH] ⏰ Expires in: 10 minutes`);
-        console.log(`[AUTH] ═══════════════════════════════════════════════════════\n`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`[AUTH] Login OTP for: ${email} | Code: ${code}`);
+        }
         
         // Delete any existing OTPs for this email before creating a new one
         try {
@@ -653,20 +668,9 @@ router.post(
 
       const { email, code } = req.body;
 
-      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
-      console.log(`[AUTH] 🔐 Verifying login OTP for: ${email}`);
-      console.log(`[AUTH] 📝 Code: ${code}`);
-      console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
-
-      // First, let's check what OTP codes exist for this email
-      const debugResult = await pool.query(
-        `SELECT code, purpose, expires_at, expires_at > NOW() as is_valid FROM otp_codes WHERE email = $1`,
-        [email]
-      );
-      console.log(`[AUTH] 🔍 Found ${debugResult.rows.length} OTP code(s) in database for ${email}:`);
-      debugResult.rows.forEach((row, idx) => {
-        console.log(`[AUTH]   ${idx + 1}. Code: ${row.code}, Purpose: ${row.purpose}, Valid: ${row.is_valid}, Expires: ${row.expires_at}`);
-      });
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[AUTH] Verifying login OTP for: ${email}`);
+      }
 
       // Check if code is valid
       const result = await pool.query(
@@ -675,14 +679,11 @@ router.post(
       );
 
       if (result.rows.length === 0) {
-        console.log(`[AUTH] ❌ Invalid or expired OTP code for ${email}`);
         return next(new AppError('Invalid or expired verification code', 400));
       }
 
       // Delete used code
       await pool.query('DELETE FROM otp_codes WHERE email = $1 AND purpose = $2', [email, '2fa']);
-
-      console.log(`[AUTH] ✅ OTP verified successfully for ${email}`);
 
       // Get user information
       const pwCol = await detectPasswordColumn();
@@ -720,8 +721,6 @@ router.post(
 
       // Generate token
       const token = generateToken(user.id);
-
-      console.log(`[AUTH] ✅ Token generated successfully for ${email}`);
 
       res.json({
         success: true,
@@ -774,33 +773,21 @@ router.post('/forgot-password', [
   body('email').isEmail().withMessage('Valid email is required')
 ], async (req, res, next) => {
   try {
-    console.log('\n[AUTH] ═══════════════════════════════════════════════════════');
-    console.log('[AUTH] 🔄 FORGOT PASSWORD REQUEST RECEIVED');
-    console.log('[AUTH] Request body:', JSON.stringify(req.body, null, 2));
-    console.log('[AUTH] ═══════════════════════════════════════════════════════\n');
-    
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      console.log('[AUTH] ❌ Validation errors:', errors.array());
       return res.status(400).json({ success: false, errors: errors.array() });
     }
 
     const { email } = req.body;
-    console.log(`[AUTH] Processing forgot password for: ${email}`);
 
     // Check if user exists
     const userResult = await pool.query('SELECT id, email FROM users WHERE email = $1', [email]);
     
-    console.log(`[AUTH] User lookup result: Found ${userResult.rows.length} user(s)`);
-    
     if (userResult.rows.length === 0) {
-      console.log(`[AUTH] ⚠️  User not found for email: ${email} (returning success for security)`);
       // Don't reveal if user exists or not for security
       return res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
     }
 
-    console.log(`[AUTH] ✓ User found, generating OTP code...`);
-    
     // Generate OTP code
     const code = generateOtpCode();
     
@@ -818,29 +805,26 @@ router.post('/forgot-password', [
       [email, code, 'reset-password']
     );
 
-    console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
-    console.log(`[AUTH] 📧 Password Reset Request for: ${email}`);
-    console.log(`[AUTH] 🔐 Reset Code: ${code}`);
-    console.log(`[AUTH] ⏰ Expires in: 10 minutes`);
-    console.log(`[AUTH] ═══════════════════════════════════════════════════════`);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[AUTH] Password reset OTP for: ${email} | Code: ${code}`);
+    }
 
     // Send reset code via email (await to catch errors immediately)
     let emailSent = false;
     try {
       const emailResult = await sendOtpEmail(email, code, 'reset-password');
       if (emailResult.ok) {
-        console.log(`[AUTH] ✅ Email sent successfully! Message ID: ${emailResult.messageId}`);
         emailSent = true;
       } else if (emailResult.skipped) {
-        console.warn(`[AUTH] ⚠️  Email sending skipped (SendGrid not configured)`);
+        console.warn(`[AUTH] Email sending skipped (SendGrid not configured)`);
       } else {
-        console.error(`[AUTH] ❌ Failed to send email to ${email}`);
+        console.error(`[AUTH] Failed to send password reset email to ${email}`);
         if (emailResult.error) {
-          console.error(`[AUTH]    Error: ${emailResult.error.message || emailResult.error}`);
+          console.error(`[AUTH] Error: ${emailResult.error.message || emailResult.error}`);
         }
       }
     } catch (err) {
-      console.error('[AUTH] ❌ Error sending password reset OTP:', err.message || err);
+      console.error('[AUTH] Error sending password reset OTP:', err.message || err);
       if (err.response) {
         console.error('[AUTH] SendGrid response:', err.response.body);
       }

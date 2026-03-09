@@ -210,12 +210,16 @@ router.put('/profile', protect, async (req, res, next) => {
 
             if (exp.id) {
               // Existing entry — update fields but preserve verification_status
+              // Use COALESCE for company_id so a null from the client never overwrites an existing
+              // link set by the verification flow, but an explicit new selection is applied.
               await client.query(
                 `UPDATE employment_history
                  SET company_name = $2, position = $3, location = $4,
                      start_date = $5, end_date = $6, is_current = $7,
-                     description = $8, updated_at = NOW()
-                 WHERE id = $1 AND candidate_id = $9`,
+                     description = $8,
+                     company_id = COALESCE($9, company_id),
+                     updated_at = NOW()
+                 WHERE id = $1 AND candidate_id = $10`,
                 [
                   exp.id,
                   exp.company || null,
@@ -225,16 +229,18 @@ router.put('/profile', protect, async (req, res, next) => {
                   endDate,
                   exp.is_current || false,
                   exp.description,
+                  exp.company_id || null,
                   candidateId
                 ]
               );
             } else {
               // New entry — insert with 'pending' status
               await client.query(
-                `INSERT INTO employment_history (candidate_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+                `INSERT INTO employment_history (candidate_id, company_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW(), NOW())`,
                 [
                   candidateId,
+                  exp.company_id || null,
                   exp.company || null,
                   exp.job_title,
                   exp.location || null,

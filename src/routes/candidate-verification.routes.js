@@ -189,14 +189,17 @@ router.post('/employment-verification/update', protect, authorize('candidate'), 
     // Determine verification status based on type
     const verificationStatus = verificationType === 'manual' ? 'pending' : 'in_review';
 
-    // Update employment record
+    // Update employment record.
+    // Use COALESCE for company_id: if the re-upload form doesn't supply a new companyId (the
+    // common case), preserve the existing value so the company portal link is never broken.
     const updateResult = await pool.query(`
       UPDATE employment_history 
       SET 
-        company_id = $1,
+        company_id = COALESCE($1, company_id),
         document_url = $2,
         verification_status = $3,
         verification_type = $4,
+        rejection_reason = NULL,
         updated_at = NOW()
       WHERE id = $5 AND candidate_id = $6
       RETURNING *

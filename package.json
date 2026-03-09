@@ -7,6 +7,9 @@
   "scripts": {
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "db:migrate": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js"
   },
@@ -39,6 +42,14 @@
     "winston": "^3.11.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "@vitest/coverage-v8": "^4.0.18",
+    "nodemon": "^3.0.2",
+    "supertest": "^7.2.2",
+    "vitest": "^4.0.18"
+  },
+  "vitest": {
+    "environment": "node",
+    "globals": true,
+    "testMatch": ["src/__tests__/**/*.test.js"]
   }
 }
