@@ -185,61 +185,129 @@ router.put('/profile', protect, async (req, res, next) => {
     try {
       await client.query('BEGIN');
 
-      // Handle employment history
+      // Handle employment history (upsert to preserve verification_status)
       if (experiences && Array.isArray(experiences)) {
-        // Delete existing employment records
-        await client.query('DELETE FROM employment_history WHERE candidate_id = $1', [candidateId]);
+        // Collect IDs of submitted existing entries
+        const submittedIds = experiences
+          .filter(exp => exp.id)
+          .map(exp => exp.id);
 
-        // Insert new employment records
+        // Delete only entries that were removed (not in submitted list)
+        if (submittedIds.length > 0) {
+          await client.query(
+            `DELETE FROM employment_history WHERE candidate_id = $1 AND id != ALL($2::uuid[])`,
+            [candidateId, submittedIds]
+          );
+        } else {
+          // No existing entries submitted — delete all
+          await client.query('DELETE FROM employment_history WHERE candidate_id = $1', [candidateId]);
+        }
+
         for (const exp of experiences) {
           if (exp.job_title && exp.description) {
-            // Convert month format to date format
             const startDate = exp.start_month ? `${exp.start_month}-01` : null;
             const endDate = exp.end_month ? `${exp.end_month}-01` : null;
 
-            await client.query(
-              `INSERT INTO employment_history (candidate_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
-              [
-                candidateId,
-                exp.company || null,
-                exp.job_title,
-                exp.location || null,
-                startDate,
-                endDate,
-                exp.is_current || false,
-                exp.description
-              ]
-            );
+            if (exp.id) {
+              // Existing entry — update fields but preserve verification_status
+              await client.query(
+                `UPDATE employment_history
+                 SET company_name = $2, position = $3, location = $4,
+                     start_date = $5, end_date = $6, is_current = $7,
+                     description = $8, updated_at = NOW()
+                 WHERE id = $1 AND candidate_id = $9`,
+                [
+                  exp.id,
+                  exp.company || null,
+                  exp.job_title,
+                  exp.location || null,
+                  startDate,
+                  endDate,
+                  exp.is_current || false,
+                  exp.description,
+                  candidateId
+                ]
+              );
+            } else {
+              // New entry — insert with 'pending' status
+              await client.query(
+                `INSERT INTO employment_history (candidate_id, company_name, position, location, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+                [
+                  candidateId,
+                  exp.company || null,
+                  exp.job_title,
+                  exp.location || null,
+                  startDate,
+                  endDate,
+                  exp.is_current || false,
+                  exp.description
+                ]
+              );
+            }
           }
         }
       }
 
-      // Handle education history
+      // Handle education history (upsert to preserve verification_status)
       if (educations && Array.isArray(educations)) {
-        // Delete existing education records
-        await client.query('DELETE FROM education_history WHERE candidate_id = $1', [candidateId]);
+        // Collect IDs of submitted existing entries
+        const submittedEduIds = educations
+          .filter(ed => ed.id)
+          .map(ed => ed.id);
 
-        // Insert new education records
+        // Delete only entries that were removed
+        if (submittedEduIds.length > 0) {
+          await client.query(
+            `DELETE FROM education_history WHERE candidate_id = $1 AND id != ALL($2::uuid[])`,
+            [candidateId, submittedEduIds]
+          );
+        } else {
+          await client.query('DELETE FROM education_history WHERE candidate_id = $1', [candidateId]);
+        }
+
         for (const ed of educations) {
           if (ed.institution && ed.degree) {
             const startDate = ed.start_month ? `${ed.start_month}-01` : null;
             const endDate = ed.end_month ? `${ed.end_month}-01` : null;
 
-            await client.query(
-              `INSERT INTO education_history (candidate_id, institution, degree, field_of_study, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
-              [
-                candidateId,
-                ed.institution,
-                ed.degree,
-                ed.field_of_study || null,
-                startDate,
-                endDate,
-                ed.is_current || false,
-                ed.description || null
-              ]
-            );
+            if (ed.id) {
+              // Existing entry — update fields but preserve verification_status
+              await client.query(
+                `UPDATE education_history
+                 SET institution = $2, degree = $3, field_of_study = $4,
+                     start_date = $5, end_date = $6, is_current = $7,
+                     description = $8, updated_at = NOW()
+                 WHERE id = $1 AND candidate_id = $9`,
+                [
+                  ed.id,
+                  ed.institution,
+                  ed.degree,
+                  ed.field_of_study || null,
+                  startDate,
+                  endDate,
+                  ed.is_current || false,
+                  ed.description || null,
+                  candidateId
+                ]
+              );
+            } else {
+              // New entry — insert with 'pending' status
+              await client.query(
+                `INSERT INTO education_history (candidate_id, institution, degree, field_of_study, start_date, end_date, is_current, description, verification_status, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+                [
+                  candidateId,
+                  ed.institution,
+                  ed.degree,
+                  ed.field_of_study || null,
+                  startDate,
+                  endDate,
+                  ed.is_current || false,
+                  ed.description || null
+                ]
+              );
+            }
           }
         }
       }
