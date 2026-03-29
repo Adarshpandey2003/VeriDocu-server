@@ -57,7 +57,7 @@ export async function sendOtpEmail(toEmail, code, purpose = 'login') {
     <body>
       <div class="container">
         <div class="header">
-          <h1>🔐 VeriBoard</h1>
+          <h1>VeriBoard</h1>
         </div>
         <div class="content">
           <p class="message">Hello,</p>
@@ -75,7 +75,7 @@ export async function sendOtpEmail(toEmail, code, purpose = 'login') {
           </div>
 
           <div class="warning">
-            <p><strong>⚠️ Security Notice:</strong> Never share this code with anyone. VeriBoard staff will never ask for your verification code.</p>
+            <p><strong>Security Notice:</strong> Never share this code with anyone. VeriBoard staff will never ask for your verification code.</p>
           </div>
 
           <p class="message">
@@ -104,32 +104,18 @@ If you didn't request this code, please ignore this email.
 Professional Verification Platform
   `.trim();
 
-  const msg = {
-    to: toEmail,
-    from: {
-      email: from,
-      name: 'VeriBoard'
-    },
-    subject: subject,
-    text: text,
-    html: html,
-  };
-
   try {
-    console.log('\n═══════════════════════════════════════════════════════════');
-    console.log(`[RESEND] 📧 ATTEMPTING TO SEND EMAIL`);
-    console.log(`[RESEND] To: ${toEmail}`);
-    console.log(`[RESEND] From: VeriBoard <${from}>`);
-    console.log(`[RESEND] Subject: ${subject}`);
-    console.log(`[RESEND] Code: ${code}`);
-    console.log(`[RESEND] Purpose: ${purpose}`);
-    console.log('═══════════════════════════════════════════════════════════\n');
-    
+    console.log(`[RESEND] Sending ${purpose} email to ${toEmail}`);
+
     const { data, error } = await resend.emails.send({
       from: `VeriBoard <${from}>`,
       to: [toEmail],
       subject: subject,
       html: html,
+      text: text,
+      headers: {
+        'List-Unsubscribe': `<mailto:${from}>`,
+      },
     });
 
     console.log('[RESEND] Resend API call completed. Checking result...\n');

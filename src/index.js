@@ -35,6 +35,7 @@ import publicRoutes from './routes/public.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import candidateVerificationRoutes from './routes/candidate-verification.routes.js';
 import companyVerificationRoutes from './routes/company-verification.routes.js';
+import resumeRoutes from './routes/resume.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -130,6 +131,7 @@ app.use('/api/search', searchRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/resume', resumeRoutes);
 
 // Development-only debug routes removed
 

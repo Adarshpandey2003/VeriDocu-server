@@ -68,13 +68,10 @@ router.get('/suggestions', async (req, res) => {
 // @access  Public
 router.get('/', async (req, res) => {
   try {
-    const { 
-      search, 
-      location, 
-      radius, 
-      userLat, 
-      userLng,
-      salaryMin, 
+    const {
+      search,
+      location,
+      salaryMin,
       salaryMax,
       employmentType,
       companyId,
@@ -135,7 +132,7 @@ router.get('/', async (req, res) => {
     }
 
     // Location filter (simple text match)
-    if (location && location.trim() && !radius) {
+    if (location && location.trim()) {
       query += ` AND j.location ILIKE $${paramIndex}`;
       params.push(`%${location.trim()}%`);
       paramIndex++;
