@@ -9,6 +9,7 @@ const FOLDERS = {
   PROFILE_PIC: 'profile_pic',
   RESUME: 'resume',
   COMPANY_LOGO: 'company_logo',
+  CMS_DOCS: 'cms_docs',
 };
 
 // Export bucket constants as named exports so other modules can import them directly

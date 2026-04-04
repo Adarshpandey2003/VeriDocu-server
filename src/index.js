@@ -36,6 +36,8 @@ import adminRoutes from './routes/admin.routes.js';
 import candidateVerificationRoutes from './routes/candidate-verification.routes.js';
 import companyVerificationRoutes from './routes/company-verification.routes.js';
 import resumeRoutes from './routes/resume.routes.js';
+import cmsRoutes from './routes/cms.routes.js';
+import adminCmsRoutes from './routes/admin-cms.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -131,6 +133,8 @@ app.use('/api/search', searchRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/admin/cms', adminCmsRoutes);
+app.use('/api/cms', cmsRoutes);
 app.use('/api/resume', resumeRoutes);
 
 // Development-only debug routes removed
@@ -146,6 +150,65 @@ app.use('*', (req, res) => {
 // Error handling middleware
 app.use(errorHandler);
 
+// Auto-migrate: ensure cms_posts table and documents column exist
+const runCmsMigrations = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cms_posts (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        slug            TEXT NOT NULL UNIQUE,
+        title           TEXT NOT NULL,
+        organization    TEXT NOT NULL,
+        category        TEXT NOT NULL CHECK (category IN (
+                          'latest-jobs','results','admit-card',
+                          'answer-key','syllabus','admissions'
+                        )),
+        status          TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published')),
+        is_featured     BOOLEAN NOT NULL DEFAULT false,
+        brief_info          TEXT,
+        important_dates     JSONB DEFAULT '{}',
+        application_fee     JSONB DEFAULT '{}',
+        age_limit           JSONB DEFAULT '{}',
+        vacancy_details     JSONB DEFAULT '[]',
+        eligibility         TEXT,
+        how_to_apply        TEXT,
+        important_links     JSONB DEFAULT '[]',
+        advertisement_no    TEXT,
+        total_vacancies     INTEGER,
+        documents           JSONB DEFAULT '[]',
+        meta_title          TEXT,
+        meta_description    TEXT,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        published_at TIMESTAMPTZ,
+        created_by   UUID REFERENCES users(id)
+      )
+    `);
+    // Add documents column to existing installs that ran the original migration
+    await pool.query(`ALTER TABLE cms_posts ADD COLUMN IF NOT EXISTS documents JSONB DEFAULT '[]'`);
+    // Indexes
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cms_posts_slug ON cms_posts(slug)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cms_posts_category ON cms_posts(category)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cms_posts_status ON cms_posts(status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cms_posts_published_at ON cms_posts(published_at DESC) WHERE status = 'published'`);
+    // updated_at trigger
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_cms_posts_updated_at()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN NEW.updated_at = now(); RETURN NEW; END; $$
+    `);
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trg_cms_posts_updated_at ON cms_posts;
+      CREATE TRIGGER trg_cms_posts_updated_at
+        BEFORE UPDATE ON cms_posts
+        FOR EACH ROW EXECUTE FUNCTION update_cms_posts_updated_at()
+    `);
+    logger.info('✅ CMS migrations applied');
+  } catch (err) {
+    logger.error('CMS migration error:', err.message || err);
+  }
+};
+
 // Start server only if not in Vercel environment
 if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
@@ -153,6 +216,8 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
     logger.info(`📝 Environment: ${process.env.NODE_ENV}`);
     logger.info(`🔐 ENABLE_OTP_ON_LOGIN=${process.env.ENABLE_OTP_ON_LOGIN || 'unset'}`);
   });
+
+  runCmsMigrations();
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
   const cleanupOldNotifications = async () => {
