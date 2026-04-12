@@ -580,8 +580,13 @@ router.post(
       }
 
       // If OTP-on-login is enabled, send a one-time code and require verification
+      // Tester accounts (listed in TESTER_EMAILS env or matching tester@veriboard.in) bypass OTP
+      const testerEmails = (process.env.TESTER_EMAILS || 'tester@veriboard.in')
+        .split(',').map(e => e.trim().toLowerCase());
+      const isTester = testerEmails.includes(email.toLowerCase());
+
       const enableOtpOnLogin = process.env.ENABLE_OTP_ON_LOGIN === 'true';
-      if (enableOtpOnLogin) {
+      if (enableOtpOnLogin && !isTester) {
         const code = generateOtpCode();
         if (process.env.NODE_ENV !== 'production') {
           console.log(`[AUTH] Login OTP for: ${email} | Code: ${code}`);
