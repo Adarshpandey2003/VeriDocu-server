@@ -3,7 +3,7 @@ import pool from '../config/database.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { supabase } from '../config/supabase.js';
-import { BUCKET_NAME, createSignedUrl } from '../utils/supabaseStorage.js';
+import { BUCKET_NAME, createSignedUrl, signImageUrl } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
@@ -161,35 +161,6 @@ router.get('/verifications/stats', async (req, res, next) => {
 
     const companyVerificationsResult = await pool.query(companyVerificationsQuery, companyQueryParams);
 
-    // Helper function to generate signed URL for images
-    const getSignedImageUrl = async (imageUrl) => {
-      if (!imageUrl) return null;
-      try {
-        // If it's already a full signed URL, return it
-        if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-          return imageUrl;
-        }
-        
-        // Extract file path from URL if it contains the bucket name
-        let filePath = imageUrl;
-        const urlParts = imageUrl.split('/VeriBoard_bucket/');
-        if (urlParts.length >= 2) {
-          filePath = urlParts[1];
-        }
-        
-        // Generate signed URL
-        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
-        if (!error && data?.signedUrl) {
-          return data.signedUrl;
-        }
-        
-        console.error('Failed to generate signed URL for:', filePath, error);
-      } catch (err) {
-        console.error('Error generating signed URL:', err);
-      }
-      return null; // Return null if signed URL generation fails
-    };
-
     // Combine employment and company verifications with signed URLs
     const employmentVerifications = await Promise.all(
       verificationsResult.rows.map(async (row) => ({
@@ -209,7 +180,7 @@ router.get('/verifications/stats', async (req, res, next) => {
         candidateUserId: row.user_id,
         startDate: row.start_date,
         endDate: row.end_date,
-        avatarUrl: await getSignedImageUrl(row.avatar_url),
+        avatarUrl: await signImageUrl(row.avatar_url),
       }))
     );
 
@@ -227,7 +198,7 @@ router.get('/verifications/stats', async (req, res, next) => {
         slug: row.slug,
         adminName: row.admin_name,
         email: row.admin_email,
-        logoUrl: await getSignedImageUrl(row.logo_url),
+        logoUrl: await signImageUrl(row.logo_url),
       }))
     );
 
@@ -864,18 +835,13 @@ router.put('/employments/:id', async (req, res, next) => {
       let notificationMessage = '';
       let notificationType = 'verification_update';
 
-      if (statusChanged) {
-        const statusLabels = {
-          'verified': 'Verified',
-          'rejected': 'Rejected',
-          'pending': 'Under Review'
-        };
-        notificationTitle = `Employment Verification ${statusLabels[verificationStatus] || 'Updated'}`;
-        notificationMessage = `Your employment at ${companyName} as ${position} has been ${statusLabels[verificationStatus]?.toLowerCase() || 'updated'}.`;
-      } else if (notesAdded) {
-        notificationTitle = 'Admin Note Added to Employment';
-        notificationMessage = `An admin has added a note to your employment at ${companyName} as ${position}.`;
-      }
+      const statusLabels = {
+        'verified': 'Verified',
+        'rejected': 'Rejected',
+        'pending': 'Under Review'
+      };
+      notificationTitle = `Employment Verification ${statusLabels[verificationStatus] || 'Updated'}`;
+      notificationMessage = `Your employment at ${companyName} as ${position} has been ${statusLabels[verificationStatus]?.toLowerCase() || 'updated'}.`;
 
       if (notificationMessage) {
         await pool.query(

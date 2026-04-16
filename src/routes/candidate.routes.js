@@ -3,25 +3,12 @@ import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import multer from 'multer';
+import { createUpload } from '../utils/upload.js';
 import { uploadProfilePicture, uploadCoverImage, getProfilePictureSignedUrl, createSignedUrl, BUCKET_NAME, FOLDERS, uploadToBucket } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
-// Configure multer for memory storage (files stored in memory as Buffer)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept only image files
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new AppError('Only image files are allowed', 400), false);
-    }
-  },
-});
+const upload = createUpload();
 
 // @route   GET /api/candidates/profile
 // @desc    Get current candidate's profile
@@ -782,11 +769,19 @@ router.get('/:id/cover-image-url', async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // Try to find by candidate_id
-    const result = await pool.query(
-      `SELECT cover_image_url FROM candidates WHERE id = $1`,
+    // First try to find by user_id
+    let result = await pool.query(
+      `SELECT c.cover_image_url FROM candidates c JOIN users u ON c.user_id = u.id WHERE u.id = $1`,
       [id]
     );
+
+    // If not found by user_id, try by candidate_id
+    if (result.rows.length === 0) {
+      result = await pool.query(
+        `SELECT cover_image_url FROM candidates WHERE id = $1`,
+        [id]
+      );
+    }
 
     if (result.rows.length === 0 || !result.rows[0].cover_image_url) {
       return next(new AppError('No cover image found', 404));

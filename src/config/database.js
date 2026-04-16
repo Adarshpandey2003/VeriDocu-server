@@ -37,6 +37,4 @@ pool.on('error', (err, client) => {
   // Supabase connections may be terminated by the server
 });
 
-export const query = (text, params) => pool.query(text, params);
-
 export default pool;

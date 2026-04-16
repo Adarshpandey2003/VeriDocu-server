@@ -2,28 +2,12 @@ import express from 'express';
 import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
-import multer from 'multer';
-import { uploadProfilePicture, getProfilePictureSignedUrl, uploadCompanyLogo, createSignedUrl } from '../utils/supabaseStorage.js';
-
-const BUCKET_NAME = 'VeriBoard_bucket';
+import { createUpload } from '../utils/upload.js';
+import { uploadProfilePicture, getProfilePictureSignedUrl, uploadCompanyLogo, createSignedUrl, signImageUrl, BUCKET_NAME } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
-// Configure multer for memory storage (files stored in memory as Buffer)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept only image files
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new AppError('Only image files are allowed', 400), false);
-    }
-  },
-});
+const upload = createUpload();
 
 // @route   GET /api/companies/profile
 // @desc    Get current company's profile
@@ -33,35 +17,6 @@ router.get('/profile', protect, async (req, res, next) => {
     if (req.user.account_type !== 'company') {
       return next(new AppError('Access denied. Companies only.', 403));
     }
-
-    // Helper function to generate signed URLs for images
-    const getSignedImageUrl = async (imageUrl) => {
-      if (!imageUrl) return null;
-      try {
-        // If it's already a full signed URL, return it
-        if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-          return imageUrl;
-        }
-        
-        // Extract file path from URL if it contains the bucket name
-        let filePath = imageUrl;
-        const urlParts = imageUrl.split('/VeriBoard_bucket/');
-        if (urlParts.length >= 2) {
-          filePath = urlParts[1];
-        }
-        
-        // Generate signed URL
-        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
-        if (!error && data?.signedUrl) {
-          return data.signedUrl;
-        }
-        
-        console.error('Failed to generate signed URL for:', filePath, error);
-      } catch (err) {
-        console.error('Error generating signed URL:', err);
-      }
-      return null;
-    };
 
     let result = await pool.query(
       `SELECT c.*, u.email,
@@ -102,10 +57,10 @@ router.get('/profile', protect, async (req, res, next) => {
     
     // Generate signed URLs for logo and cover image
     if (profile.logo_url) {
-      profile.logo_url = await getSignedImageUrl(profile.logo_url);
+      profile.logo_url = await signImageUrl(profile.logo_url);
     }
     if (profile.cover_image_url) {
-      profile.cover_image_url = await getSignedImageUrl(profile.cover_image_url);
+      profile.cover_image_url = await signImageUrl(profile.cover_image_url);
     }
 
     // Check if company is verified
@@ -291,39 +246,10 @@ router.get('/:slug', async (req, res, next) => {
 
     const companyRow = result.rows[0];
 
-    // Helper function to generate signed URLs
-    const getSignedImageUrl = async (imageUrl) => {
-      if (!imageUrl) return null;
-      try {
-        // If it's already a full signed URL, return it
-        if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
-          return imageUrl;
-        }
-        
-        // Extract file path from URL if it contains the bucket name
-        let filePath = imageUrl;
-        const urlParts = imageUrl.split('/VeriBoard_bucket/');
-        if (urlParts.length >= 2) {
-          filePath = urlParts[1];
-        }
-        
-        // Generate signed URL
-        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
-        if (!error && data?.signedUrl) {
-          return data.signedUrl;
-        }
-        
-        console.error('Failed to generate signed URL for:', filePath, error);
-      } catch (err) {
-        console.error('Error generating signed URL:', err);
-      }
-      return imageUrl; // Fallback to original
-    };
-
     // Generate signed URL for logo
     try {
       if (companyRow.logo_url) {
-        companyRow.companyLogo = await getSignedImageUrl(companyRow.logo_url);
+        companyRow.companyLogo = await signImageUrl(companyRow.logo_url);
       }
     } catch (err) {
       console.warn('Failed to generate signed URL for company logo:', err);
@@ -333,7 +259,7 @@ router.get('/:slug', async (req, res, next) => {
     // Generate signed URL for cover image
     try {
       if (companyRow.cover_image_url) {
-        companyRow.cover_image_url = await getSignedImageUrl(companyRow.cover_image_url);
+        companyRow.cover_image_url = await signImageUrl(companyRow.cover_image_url);
       }
     } catch (err) {
       console.warn('Failed to generate signed URL for cover image:', err);
@@ -416,18 +342,6 @@ router.post('/profile/logo', protect, upload.single('logo'), async (req, res, ne
       }
       return next(new AppError('Failed to upload image', 500));
     }
-
-    // Update company profile with the new logo path
-    await pool.query(
-      'UPDATE companies SET logo_url = $1, updated_at = NOW() WHERE user_id = $2',
-      [path, userId]
-    );
-
-    res.json({
-      success: true,
-      message: 'Company logo uploaded successfully',
-      logo_path: path
-    });
   } catch (error) {
     next(error);
   }

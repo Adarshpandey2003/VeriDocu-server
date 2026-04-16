@@ -1,6 +1,6 @@
 import express from 'express';
 import crypto from 'crypto';
-import multer from 'multer';
+import { createUpload } from '../utils/upload.js';
 import pool from '../config/database.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { uploadToBucket, createSignedUrl, deleteFromBucket, BUCKET_NAME, FOLDERS } from '../utils/supabaseStorage.js';
@@ -11,26 +11,7 @@ const router = express.Router();
 router.use(protect);
 router.use(authorize('admin'));
 
-// Configure multer for document uploads (memory storage -> Supabase)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (req, file, cb) => {
-    const allowed = [
-      'application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'image/jpeg',
-      'image/png',
-      'image/webp',
-    ];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF, DOC, DOCX, JPG, PNG, WEBP files are allowed'));
-    }
-  },
-});
+const upload = createUpload({ allow: 'documents', maxSize: 10 * 1024 * 1024 });
 
 // Helper: generate slug from title
 function generateSlug(title) {

@@ -38,6 +38,7 @@ import companyVerificationRoutes from './routes/company-verification.routes.js';
 import resumeRoutes from './routes/resume.routes.js';
 import cmsRoutes from './routes/cms.routes.js';
 import adminCmsRoutes from './routes/admin-cms.routes.js';
+import feedRoutes from './routes/feed.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -136,6 +137,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/admin/cms', adminCmsRoutes);
 app.use('/api/cms', cmsRoutes);
 app.use('/api/resume', resumeRoutes);
+app.use('/api/feed', feedRoutes);
 
 // Development-only debug routes removed
 
@@ -209,6 +211,51 @@ const runCmsMigrations = async () => {
   }
 };
 
+// Auto-migrate: ensure social_posts + social_post_likes tables exist
+const runFeedMigrations = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS social_posts (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content       VARCHAR(500) NOT NULL,
+        image_url     TEXT,
+        likes_count   INTEGER NOT NULL DEFAULT 0,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS social_post_likes (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        post_id    UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+        user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(post_id, user_id)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_social_posts_user ON social_posts(user_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_social_posts_created ON social_posts(created_at DESC)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_social_post_likes_post ON social_post_likes(post_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_social_post_likes_user ON social_post_likes(user_id)');
+    // updated_at trigger
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_social_posts_updated_at()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN NEW.updated_at = now(); RETURN NEW; END; $$
+    `);
+    await pool.query(`
+      DROP TRIGGER IF EXISTS trg_social_posts_updated_at ON social_posts;
+      CREATE TRIGGER trg_social_posts_updated_at
+        BEFORE UPDATE ON social_posts
+        FOR EACH ROW EXECUTE FUNCTION update_social_posts_updated_at()
+    `);
+    logger.info('✅ Feed migrations applied');
+  } catch (err) {
+    logger.error('Feed migration error:', err.message || err);
+  }
+};
+
 // Start server only if not in Vercel environment
 if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
@@ -218,6 +265,7 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   });
 
   runCmsMigrations();
+  runFeedMigrations();
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
   const cleanupOldNotifications = async () => {

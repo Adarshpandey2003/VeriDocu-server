@@ -1,7 +1,7 @@
 import express from 'express';
 import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
-import { deleteFromBucket, BUCKET_NAME, createSignedUrl } from '../utils/supabaseStorage.js';
+import { deleteFromBucket, BUCKET_NAME, createSignedUrl, signImageUrl } from '../utils/supabaseStorage.js';
 
 const router = express.Router();
 
@@ -1172,36 +1172,9 @@ router.get('/applications/my-applications', protect, async (req, res) => {
       ORDER BY ja.applied_at DESC
     `, [userId]);
     
-    // Helper function to generate signed URLs for company logos
-    const getSignedLogoUrl = async (logoUrl) => {
-      if (!logoUrl) return null;
-      try {
-        // If it's already a full URL, return it
-        if (logoUrl.startsWith('http://') || logoUrl.startsWith('https://')) {
-          return logoUrl;
-        }
-        
-        // Extract file path from URL if it contains the bucket name
-        let filePath = logoUrl;
-        const urlParts = logoUrl.split('/VeriBoard_bucket/');
-        if (urlParts.length >= 2) {
-          filePath = urlParts[1];
-        }
-        
-        // Generate signed URL
-        const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, 3600);
-        if (!error && data?.signedUrl) {
-          return data.signedUrl;
-        }
-      } catch (err) {
-        console.error('Error generating signed URL for logo:', err);
-      }
-      return null;
-    };
-    
     // Generate signed URLs for all company logos
     const applications = await Promise.all(result.rows.map(async app => {
-      const signedLogoUrl = await getSignedLogoUrl(app.company_logo);
+      const signedLogoUrl = await signImageUrl(app.company_logo);
       
       return {
         id: app.id,

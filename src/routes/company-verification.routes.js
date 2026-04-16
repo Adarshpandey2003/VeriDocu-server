@@ -1,30 +1,13 @@
 import express from 'express';
 import pool from '../config/database.js';
 import { protect, authorize } from '../middleware/auth.js';
-import multer from 'multer';
+import { createUpload } from '../utils/upload.js';
 import { supabase } from '../config/supabase.js';
 import path from 'path';
 
 const router = express.Router();
 
-// Configure multer for memory storage (we'll upload to Supabase)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|pdf/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('Only PDF and image files (JPG, PNG) are allowed'));
-    }
-  }
-});
+const upload = createUpload({ allow: ['jpeg', 'jpg', 'png', 'pdf'] });
 
 // Upload HR verification document
 router.post('/hr-verification', protect, authorize('company'), upload.single('document'), async (req, res) => {

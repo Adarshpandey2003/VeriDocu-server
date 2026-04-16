@@ -1,10 +1,16 @@
 import { supabase } from '../config/supabase.js';
+import NodeCache from 'node-cache';
 
 // Helper utilities for uploading files and getting URLs from Supabase Storage
 // Bucket name used by the app: 'VeriBoard_bucket' (create this bucket in Supabase console)
 // Bucket contains folders: 'profile_pic' and 'resume'
 
 const BUCKET_NAME = 'VeriBoard_bucket';
+
+// In-memory cache for signed URLs.
+// TTL 50 min (URLs are valid for 60 min) — leaves a 10-min buffer so clients never get an expired URL.
+// checkperiod 120s — evict stale entries every 2 minutes to free memory.
+const signedUrlCache = new NodeCache({ stdTTL: 3000, checkperiod: 120 });
 const FOLDERS = {
   PROFILE_PIC: 'profile_pic',
   RESUME: 'resume',
@@ -32,6 +38,9 @@ export async function uploadToBucket(bucket, path, file, options = {}) {
       upsert,
       contentType,
     });
+
+    // Invalidate any cached signed URL for this path
+    if (!res.error) signedUrlCache.del(`${bucket}:${path}`);
 
     return res; // { data, error }
   } catch (err) {
@@ -105,18 +114,33 @@ export async function uploadCompanyLogo(userId, fileBuffer, fileName, options = 
 }
 
 /**
- * Get content type for resume files
- * @param {string} extension - file extension
- * @returns {string} content type
+ * Resolve a storage path or URL into a usable signed URL.
+ * Handles: null → null, full http(s) URLs → passthrough,
+ * bucket-prefixed paths → extract, plain paths → sign directly.
+ * @param {string|null} imagePath - storage path or URL
+ * @param {number} expiresInSeconds - signed URL lifetime (default 3600)
+ * @returns {Promise<string|null>}
  */
-function getContentTypeForResume(extension) {
-  const contentTypes = {
-    pdf: 'application/pdf',
-    doc: 'application/msword',
-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    txt: 'text/plain',
-  };
-  return contentTypes[extension] || 'application/octet-stream';
+export async function signImageUrl(imagePath, expiresInSeconds = 3600) {
+  if (!imagePath) return null;
+  try {
+    // Already a full URL — return as-is
+    if (/^https?:\/\//i.test(imagePath)) return imagePath;
+
+    // Extract relative path if it contains the bucket name
+    let filePath = imagePath;
+    const bucketSegment = `/${BUCKET_NAME}/`;
+    const idx = imagePath.indexOf(bucketSegment);
+    if (idx !== -1) {
+      filePath = imagePath.slice(idx + bucketSegment.length);
+    }
+
+    const { data, error } = await createSignedUrl(BUCKET_NAME, filePath, expiresInSeconds);
+    if (!error && data?.signedUrl) return data.signedUrl;
+  } catch (_) {
+    // fall through
+  }
+  return null;
 }
 
 /**
@@ -133,14 +157,31 @@ export function getPublicUrl(bucket, path) {
 }
 
 /**
- * Create a signed (temporary) URL for a private object in storage
+ * Create a signed (temporary) URL for a private object in storage.
+ * Results are cached in-memory for 50 minutes (URLs expire at 60 min).
  * @param {string} bucket
  * @param {string} path
  * @param {number} expiresInSeconds default 60 (1 minute)
  */
 export async function createSignedUrl(bucket, path, expiresInSeconds = 60) {
+  if (!path) return { data: null, error: 'No path provided' };
+
+  // Only cache when the caller requests long-lived URLs (≥ 10 min)
+  const useCache = expiresInSeconds >= 600;
+  const cacheKey = `${bucket}:${path}`;
+
+  if (useCache) {
+    const cached = signedUrlCache.get(cacheKey);
+    if (cached) return { data: cached, error: null };
+  }
+
   try {
     const { data, error } = await supabase.storage.from(bucket).createSignedUrl(path, expiresInSeconds);
+
+    if (!error && data && useCache) {
+      signedUrlCache.set(cacheKey, data);
+    }
+
     return { data, error };
   } catch (err) {
     return { data: null, error: err };
@@ -156,6 +197,10 @@ export async function deleteFromBucket(bucket, path) {
   if (!bucket || !path) return { data: null, error: 'Missing bucket or path' };
   try {
     const res = await supabase.storage.from(bucket).remove([path]);
+
+    // Invalidate cached signed URL
+    signedUrlCache.del(`${bucket}:${path}`);
+
     return res; // { data, error }
   } catch (err) {
     return { data: null, error: err };
@@ -180,6 +225,7 @@ export default {
   uploadCompanyLogo,
   getPublicUrl,
   createSignedUrl,
+  signImageUrl,
   getProfilePictureSignedUrl,
   deleteFromBucket,
   BUCKET_NAME,
