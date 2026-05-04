@@ -39,6 +39,7 @@ import resumeRoutes from './routes/resume.routes.js';
 import cmsRoutes from './routes/cms.routes.js';
 import adminCmsRoutes from './routes/admin-cms.routes.js';
 import feedRoutes from './routes/feed.routes.js';
+import subscriptionRoutes from './routes/subscription.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -84,6 +85,9 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/verify-email', authLimiter);
 app.use('/api/auth/verify-login-otp', authLimiter);
 app.use('/api/auth/forgot-password', authLimiter);
+
+// Raw body parser for Razorpay webhook (must be before express.json)
+app.use('/api/subscriptions/webhook', express.raw({ type: 'application/json' }));
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
@@ -138,6 +142,7 @@ app.use('/api/admin/cms', adminCmsRoutes);
 app.use('/api/cms', cmsRoutes);
 app.use('/api/resume', resumeRoutes);
 app.use('/api/feed', feedRoutes);
+app.use('/api/subscriptions', subscriptionRoutes);
 
 // Development-only debug routes removed
 
@@ -256,6 +261,57 @@ const runFeedMigrations = async () => {
   }
 };
 
+// Auto-migrate: ensure subscriptions tables exist
+const runSubscriptionMigrations = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        razorpay_subscription_id  TEXT NOT NULL UNIQUE,
+        razorpay_plan_id          TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'created',
+        current_start   TIMESTAMPTZ,
+        current_end     TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscription_payments (
+        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        subscription_id   UUID NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+        razorpay_payment_id   TEXT NOT NULL UNIQUE,
+        amount            INTEGER NOT NULL,
+        currency          TEXT NOT NULL DEFAULT 'INR',
+        status            TEXT NOT NULL,
+        paid_at           TIMESTAMPTZ,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_subscriptions_rzp_id ON subscriptions(razorpay_subscription_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_sub_payments_subscription ON subscription_payments(subscription_id)');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS razorpay_customer_id TEXT');
+    logger.info('✅ Subscription migrations applied');
+  } catch (err) {
+    logger.error('Subscription migration error:', err.message || err);
+  }
+};
+
+// Auto-migrate: ensure linkedin_id column exists
+const runLinkedinMigration = async () => {
+  try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS linkedin_id VARCHAR(255) UNIQUE');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_users_linkedin_id ON users(linkedin_id)');
+    await pool.query('ALTER TABLE users DROP CONSTRAINT IF EXISTS users_auth_method_check');
+    await pool.query("ALTER TABLE users ADD CONSTRAINT users_auth_method_check CHECK (password IS NOT NULL OR google_id IS NOT NULL OR linkedin_id IS NOT NULL)");
+    logger.info('LinkedIn migration applied');
+  } catch (err) {
+    logger.error('LinkedIn migration error:', err.message || err);
+  }
+};
+
 // Start server only if not in Vercel environment
 if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
@@ -266,6 +322,8 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
 
   runCmsMigrations();
   runFeedMigrations();
+  runSubscriptionMigrations();
+  runLinkedinMigration();
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
   const cleanupOldNotifications = async () => {

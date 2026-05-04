@@ -116,6 +116,20 @@ router.post(
   validate,
   async (req, res, next) => {
     try {
+      // Free-tier limit: 1 resume generation
+      const limCheck = await pool.query(
+        'SELECT is_pro, resume_generation_count FROM users WHERE id = $1',
+        [req.user.id]
+      );
+      const limUser = limCheck.rows[0];
+      if (!limUser.is_pro && (limUser.resume_generation_count || 0) >= 1) {
+        return res.status(403).json({
+          success: false,
+          message: 'Free plan allows 1 resume generation. Upgrade to Pro for unlimited access.',
+          code: 'PRO_REQUIRED',
+        });
+      }
+
       const { resumeData, targetRole } = req.body;
       const resumeStr =
         typeof resumeData === 'string'
@@ -228,6 +242,12 @@ Generate the complete LaTeX resume now.`;
       if (!latex.includes('\\documentclass')) {
         return next(new AppError('AI returned invalid LaTeX. Please try again.', 502));
       }
+
+      // Increment generation count
+      await pool.query(
+        'UPDATE users SET resume_generation_count = COALESCE(resume_generation_count, 0) + 1 WHERE id = $1',
+        [req.user.id]
+      );
 
       res.json({ latex });
     } catch (err) {
@@ -397,6 +417,27 @@ router.post(
   }
 );
 
+// ── Generation status (free-tier limits) ──────────────────────────────────
+router.get('/generation-status', protect, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      'SELECT is_pro, resume_generation_count, cover_letter_generation_count FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const u = result.rows[0];
+    res.json({
+      success: true,
+      isPro: !!u.is_pro,
+      resumeCount: u.resume_generation_count || 0,
+      coverLetterCount: u.cover_letter_generation_count || 0,
+      resumeLimit: u.is_pro ? null : 1,
+      coverLetterLimit: u.is_pro ? null : 1,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── List resumes ───────────────────────────────────────────────────────────
 router.get('/', protect, async (req, res, next) => {
   try {
@@ -475,6 +516,20 @@ router.post(
   validate,
   async (req, res, next) => {
     try {
+      // Free-tier limit: 1 cover letter generation
+      const limCheck = await pool.query(
+        'SELECT is_pro, cover_letter_generation_count FROM users WHERE id = $1',
+        [req.user.id]
+      );
+      const limUser = limCheck.rows[0];
+      if (!limUser.is_pro && (limUser.cover_letter_generation_count || 0) >= 1) {
+        return res.status(403).json({
+          success: false,
+          message: 'Free plan allows 1 cover letter generation. Upgrade to Pro for unlimited access.',
+          code: 'PRO_REQUIRED',
+        });
+      }
+
       const { resumeData, targetRole, jobDescription, companyName } = req.body;
       const resumeStr =
         typeof resumeData === 'string'
@@ -546,6 +601,12 @@ Write the cover letter now.`;
       if (!coverLetter) {
         return next(new AppError('AI returned empty response. Please try again.', 502));
       }
+
+      // Increment generation count
+      await pool.query(
+        'UPDATE users SET cover_letter_generation_count = COALESCE(cover_letter_generation_count, 0) + 1 WHERE id = $1',
+        [req.user.id]
+      );
 
       res.json({ coverLetter });
     } catch (err) {

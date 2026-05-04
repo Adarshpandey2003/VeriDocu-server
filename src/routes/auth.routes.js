@@ -37,6 +37,31 @@ function deletePendingRegistration(email) {
 // Temporary store for Google profile data (for new user registration)
 const googleProfileStore = new Map();
 
+// Temporary store for LinkedIn profile data (for new user registration)
+const linkedinProfileStore = new Map();
+
+function storeLinkedinProfile(code, profileData) {
+  linkedinProfileStore.set(code, {
+    profileData,
+    expiresAt: Date.now() + 10 * 60 * 1000
+  });
+  setTimeout(() => linkedinProfileStore.delete(code), 10 * 60 * 1000);
+}
+
+function retrieveLinkedinProfile(code) {
+  const data = linkedinProfileStore.get(code);
+  if (!data) return null;
+  if (Date.now() > data.expiresAt) {
+    linkedinProfileStore.delete(code);
+    return null;
+  }
+  return data.profileData;
+}
+
+function deleteLinkedinProfile(code) {
+  linkedinProfileStore.delete(code);
+}
+
 function storeAuthCode(code, userId, userData) {
   authCodeStore.set(code, {
     userId,
@@ -330,6 +355,7 @@ router.post('/otp/verify', async (req, res, next) => {
         id: user.id,
         email: user.email,
         accountType: user.account_type || accountType,
+        isPro: !!user.is_pro,
       },
     });
   } catch (error) {
@@ -519,6 +545,7 @@ router.post('/verify-email', async (req, res, next) => {
         email: user.email,
         accountType: user.account_type,
         name: user.name,
+        isPro: !!user.is_pro,
       },
     });
   } catch (error) {
@@ -647,6 +674,7 @@ router.post(
           email: user.email,
           accountType: user.account_type,
           role: user.account_type,
+          isPro: !!user.is_pro,
         },
       });
     } catch (error) {
@@ -737,6 +765,7 @@ router.post(
           email: user.email,
           accountType: user.account_type,
           role: user.account_type,
+          isPro: !!user.is_pro,
         },
       });
     } catch (error) {
@@ -1019,7 +1048,8 @@ router.post('/google/exchange',
           email: user.email,
           accountType: user.account_type,
           name: user.name,
-          role: user.account_type
+          role: user.account_type,
+          isPro: !!user.is_pro,
         }
       });
     } catch (error) {
@@ -1126,7 +1156,213 @@ router.post('/google/complete-registration',
           email: newUser.email,
           accountType: newUser.account_type,
           name: newUser.name,
-          role: newUser.account_type
+          role: newUser.account_type,
+          isPro: !!newUser.is_pro,
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// ===== LinkedIn OAuth Routes (OpenID Connect — no passport) =====
+
+router.get('/linkedin', (req, res) => {
+  const clientId = process.env.LINKEDIN_CLIENT_ID;
+  if (!clientId) {
+    return res.status(503).json({ success: false, message: 'LinkedIn login not configured' });
+  }
+
+  const state = crypto.randomBytes(16).toString('hex');
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: process.env.LINKEDIN_REDIRECT_URI,
+    scope: 'openid profile email',
+    state,
+  });
+
+  res.redirect(`https://www.linkedin.com/oauth/v2/authorization?${params}`);
+});
+
+router.get('/linkedin/callback', async (req, res) => {
+  const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+
+  try {
+    const { code, error } = req.query;
+    if (error || !code) {
+      return res.redirect(`${clientUrl}/auth/login?error=linkedin_auth_failed`);
+    }
+
+    // Exchange code for access token
+    const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        client_id: process.env.LINKEDIN_CLIENT_ID,
+        client_secret: process.env.LINKEDIN_CLIENT_SECRET,
+        redirect_uri: process.env.LINKEDIN_REDIRECT_URI,
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      console.error('LinkedIn token exchange failed:', await tokenRes.text());
+      return res.redirect(`${clientUrl}/auth/login?error=linkedin_token_failed`);
+    }
+
+    const { access_token } = await tokenRes.json();
+
+    // Fetch user profile from OpenID Connect userinfo endpoint
+    const profileRes = await fetch('https://api.linkedin.com/v2/userinfo', {
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
+
+    if (!profileRes.ok) {
+      console.error('LinkedIn userinfo failed:', await profileRes.text());
+      return res.redirect(`${clientUrl}/auth/login?error=linkedin_profile_failed`);
+    }
+
+    const profile = await profileRes.json();
+    const linkedinId = profile.sub;
+    const email = profile.email;
+    const name = profile.name || [profile.given_name, profile.family_name].filter(Boolean).join(' ') || 'Unknown';
+    const picture = profile.picture || null;
+
+    if (!email) {
+      return res.redirect(`${clientUrl}/auth/login?error=linkedin_no_email`);
+    }
+
+    // Check if user exists with this LinkedIn ID
+    let userResult = await pool.query('SELECT * FROM users WHERE linkedin_id = $1', [linkedinId]);
+
+    if (userResult.rows.length > 0) {
+      const user = userResult.rows[0];
+      const authCode = crypto.randomBytes(32).toString('hex');
+      storeAuthCode(authCode, user.id, {
+        email: user.email,
+        accountType: user.account_type || 'candidate',
+      });
+      return res.redirect(`${clientUrl}/auth/callback?code=${authCode}`);
+    }
+
+    // Check if user exists with same email
+    userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+
+    if (userResult.rows.length > 0) {
+      const user = userResult.rows[0];
+      await pool.query(
+        'UPDATE users SET linkedin_id = $1, profile_picture = COALESCE(profile_picture, $2) WHERE id = $3',
+        [linkedinId, picture, user.id]
+      );
+      const authCode = crypto.randomBytes(32).toString('hex');
+      storeAuthCode(authCode, user.id, {
+        email: user.email,
+        accountType: user.account_type || 'candidate',
+      });
+      return res.redirect(`${clientUrl}/auth/callback?code=${authCode}`);
+    }
+
+    // New user — redirect to complete profile
+    const profileCode = crypto.randomBytes(32).toString('hex');
+    storeLinkedinProfile(profileCode, { linkedinId, email, name, profilePicture: picture });
+    res.redirect(`${clientUrl}/auth/complete-profile?code=${profileCode}&provider=linkedin`);
+  } catch (err) {
+    console.error('LinkedIn OAuth callback error:', err);
+    res.redirect(`${clientUrl}/auth/login?error=auth_failed`);
+  }
+});
+
+router.post('/linkedin/complete-registration',
+  [
+    body('code').notEmpty().withMessage('Profile code is required'),
+    body('accountType').isIn(['candidate', 'company']).withMessage('Account type must be candidate or company'),
+    body('name').optional().trim()
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { code, accountType, name } = req.body;
+      const profileData = retrieveLinkedinProfile(code);
+
+      if (!profileData) {
+        return next(new AppError('Invalid or expired profile code', 400));
+      }
+
+      const userName = name && name.trim() ? name.trim() : profileData.name;
+
+      const existingUser = await pool.query(
+        'SELECT id FROM users WHERE email = $1',
+        [profileData.email]
+      );
+
+      if (existingUser.rows.length > 0) {
+        deleteLinkedinProfile(code);
+        return next(new AppError('User with this email already exists', 409));
+      }
+
+      let insertResult;
+      try {
+        insertResult = await pool.query(
+          `INSERT INTO users (email, linkedin_id, name, profile_picture, account_type, is_verified, password, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           RETURNING *`,
+          [
+            profileData.email,
+            profileData.linkedinId,
+            userName,
+            profileData.profilePicture,
+            accountType,
+            true,
+            null
+          ]
+        );
+      } catch (error) {
+        if (error.code === '23505' || error.constraint === 'users_email_key') {
+          deleteLinkedinProfile(code);
+          return next(new AppError('User with this email already exists', 409));
+        }
+        throw error;
+      }
+
+      const newUser = insertResult.rows[0];
+
+      if (accountType === 'candidate') {
+        await pool.query(
+          'INSERT INTO candidates (user_id, full_name, avatar_url, created_at) VALUES ($1, $2, $3, NOW())',
+          [newUser.id, userName, profileData.profilePicture]
+        );
+      } else if (accountType === 'company') {
+        const companySlug = userName.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now();
+        await pool.query(
+          'INSERT INTO companies (user_id, name, slug, logo_url, created_at) VALUES ($1, $2, $3, $4, NOW())',
+          [newUser.id, userName, companySlug, profileData.profilePicture]
+        );
+      }
+
+      deleteLinkedinProfile(code);
+
+      const token = generateToken(newUser.id, {
+        email: newUser.email,
+        accountType: newUser.account_type
+      });
+
+      res.json({
+        success: true,
+        token,
+        user: {
+          id: newUser.id,
+          email: newUser.email,
+          accountType: newUser.account_type,
+          name: newUser.name,
+          role: newUser.account_type,
+          isPro: !!newUser.is_pro,
         }
       });
     } catch (error) {

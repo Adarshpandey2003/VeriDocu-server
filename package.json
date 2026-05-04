@@ -39,9 +39,11 @@
     "nodemailer": "^6.9.7",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
+    "passport-linkedin-oauth2": "^2.0.0",
     "pdf-parse": "^1.1.4",
     "pdf-parser": "^1.0.5",
     "pg": "^8.11.3",
+    "razorpay": "^2.9.6",
     "resend": "^6.4.2",
     "winston": "^3.11.0"
   },

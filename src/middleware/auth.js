@@ -21,7 +21,7 @@ export const protect = async (req, res, next) => {
 
       // Get user from database - include name from users table
       const result = await pool.query(
-        'SELECT id, email, account_type, is_verified, name FROM users WHERE id = $1',
+        'SELECT id, email, account_type, is_verified, name, is_pro FROM users WHERE id = $1',
         [decoded.id]
       );
 
@@ -54,10 +54,12 @@ export const protect = async (req, res, next) => {
         email: user.email,
         name: displayName,
         accountType: user.account_type,
-        account_type: user.account_type, // Keep snake_case for backward compatibility
-        role: user.account_type, // Use account_type as role for authorization
+        account_type: user.account_type,
+        role: user.account_type,
         isVerified: user.is_verified,
-        is_verified: user.is_verified // Keep snake_case for backward compatibility
+        is_verified: user.is_verified,
+        isPro: !!user.is_pro,
+        is_pro: !!user.is_pro,
       };
       
       next();
