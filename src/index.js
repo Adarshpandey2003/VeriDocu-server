@@ -312,6 +312,159 @@ const runLinkedinMigration = async () => {
   }
 };
 
+// Auto-migrate: FTS search indexes + trigram
+const runSearchMigration = async () => {
+  try {
+    await pool.query('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+    await pool.query('ALTER TABLE candidates ADD COLUMN IF NOT EXISTS search_vector tsvector');
+    await pool.query('ALTER TABLE companies  ADD COLUMN IF NOT EXISTS search_vector tsvector');
+    await pool.query('ALTER TABLE jobs       ADD COLUMN IF NOT EXISTS search_vector tsvector');
+
+    await pool.query("UPDATE candidates SET search_vector = to_tsvector('english', coalesce(full_name,'') || ' ' || coalesce(title,'') || ' ' || coalesce(location,'') || ' ' || coalesce(bio,'')) WHERE search_vector IS NULL");
+    await pool.query("UPDATE companies  SET search_vector = to_tsvector('english', coalesce(name,'') || ' ' || coalesce(industry,'') || ' ' || coalesce(location,'') || ' ' || coalesce(description,'')) WHERE search_vector IS NULL");
+    await pool.query("UPDATE jobs       SET search_vector = to_tsvector('english', coalesce(title,'') || ' ' || coalesce(location,'') || ' ' || coalesce(description,'')) WHERE search_vector IS NULL");
+
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_candidates_search ON candidates USING GIN(search_vector)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_companies_search  ON companies  USING GIN(search_vector)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_jobs_search       ON jobs       USING GIN(search_vector)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_candidates_name_trgm ON candidates USING GIN(full_name gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_companies_name_trgm  ON companies  USING GIN(name gin_trgm_ops)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_jobs_title_trgm      ON jobs       USING GIN(title gin_trgm_ops)');
+
+    // Triggers
+    await pool.query(`CREATE OR REPLACE FUNCTION candidates_search_trigger() RETURNS trigger AS $$ BEGIN NEW.search_vector := to_tsvector('english', coalesce(NEW.full_name,'') || ' ' || coalesce(NEW.title,'') || ' ' || coalesce(NEW.location,'') || ' ' || coalesce(NEW.bio,'')); RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await pool.query(`CREATE OR REPLACE FUNCTION companies_search_trigger() RETURNS trigger AS $$ BEGIN NEW.search_vector := to_tsvector('english', coalesce(NEW.name,'') || ' ' || coalesce(NEW.industry,'') || ' ' || coalesce(NEW.location,'') || ' ' || coalesce(NEW.description,'')); RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await pool.query(`CREATE OR REPLACE FUNCTION jobs_search_trigger() RETURNS trigger AS $$ BEGIN NEW.search_vector := to_tsvector('english', coalesce(NEW.title,'') || ' ' || coalesce(NEW.location,'') || ' ' || coalesce(NEW.description,'')); RETURN NEW; END $$ LANGUAGE plpgsql`);
+
+    await pool.query('DROP TRIGGER IF EXISTS trg_candidates_search ON candidates');
+    await pool.query('CREATE TRIGGER trg_candidates_search BEFORE INSERT OR UPDATE ON candidates FOR EACH ROW EXECUTE FUNCTION candidates_search_trigger()');
+    await pool.query('DROP TRIGGER IF EXISTS trg_companies_search ON companies');
+    await pool.query('CREATE TRIGGER trg_companies_search BEFORE INSERT OR UPDATE ON companies FOR EACH ROW EXECUTE FUNCTION companies_search_trigger()');
+    await pool.query('DROP TRIGGER IF EXISTS trg_jobs_search ON jobs');
+    await pool.query('CREATE TRIGGER trg_jobs_search BEFORE INSERT OR UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION jobs_search_trigger()');
+
+    logger.info('FTS search migration applied');
+  } catch (err) {
+    logger.error('Search migration error:', err.message || err);
+  }
+};
+
+// Auto-migrate: feed upgrade — comments, bookmarks, connections, hashtags
+const runFeedUpgradeMigration = async () => {
+  try {
+    await pool.query('ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS comments_count INTEGER NOT NULL DEFAULT 0');
+    await pool.query('ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS shares_count INTEGER NOT NULL DEFAULT 0');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS social_post_comments (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        post_id    UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+        user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content    VARCHAR(300) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_comments_post ON social_post_comments(post_id, created_at DESC)');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS social_bookmarks (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        post_id    UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+        user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(post_id, user_id)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_bookmarks_user ON social_bookmarks(user_id, created_at DESC)');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_connections (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        follower_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        following_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(follower_id, following_id),
+        CHECK(follower_id != following_id)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_connections_follower ON user_connections(follower_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_connections_following ON user_connections(following_id)');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS hashtags (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tag        VARCHAR(100) NOT NULL UNIQUE,
+        post_count INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_hashtags_tag ON hashtags(tag)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_hashtags_count ON hashtags(post_count DESC)');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS post_hashtags (
+        post_id    UUID NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+        hashtag_id UUID NOT NULL REFERENCES hashtags(id) ON DELETE CASCADE,
+        PRIMARY KEY(post_id, hashtag_id)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_post_hashtags_hashtag ON post_hashtags(hashtag_id)');
+
+    // Backfill comments_count from existing comments
+    await pool.query(`
+      UPDATE social_posts sp SET comments_count = sub.cnt
+      FROM (SELECT post_id, COUNT(*) AS cnt FROM social_post_comments GROUP BY post_id) sub
+      WHERE sp.id = sub.post_id AND sp.comments_count != sub.cnt
+    `);
+
+    // Trigger: auto-maintain comments_count on social_posts
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_comments_count() RETURNS trigger AS $$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          UPDATE social_posts SET comments_count = comments_count + 1 WHERE id = NEW.post_id;
+          RETURN NEW;
+        ELSIF TG_OP = 'DELETE' THEN
+          UPDATE social_posts SET comments_count = GREATEST(comments_count - 1, 0) WHERE id = OLD.post_id;
+          RETURN OLD;
+        END IF;
+        RETURN NULL;
+      END $$ LANGUAGE plpgsql
+    `);
+    await pool.query('DROP TRIGGER IF EXISTS trg_comments_count ON social_post_comments');
+    await pool.query(`
+      CREATE TRIGGER trg_comments_count
+      AFTER INSERT OR DELETE ON social_post_comments
+      FOR EACH ROW EXECUTE FUNCTION update_comments_count()
+    `);
+
+    // Trigger: auto-maintain hashtags.post_count via post_hashtags
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_hashtag_post_count() RETURNS trigger AS $$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          UPDATE hashtags SET post_count = post_count + 1 WHERE id = NEW.hashtag_id;
+          RETURN NEW;
+        ELSIF TG_OP = 'DELETE' THEN
+          UPDATE hashtags SET post_count = GREATEST(post_count - 1, 0) WHERE id = OLD.hashtag_id;
+          RETURN OLD;
+        END IF;
+        RETURN NULL;
+      END $$ LANGUAGE plpgsql
+    `);
+    await pool.query('DROP TRIGGER IF EXISTS trg_post_hashtags_count ON post_hashtags');
+    await pool.query(`
+      CREATE TRIGGER trg_post_hashtags_count
+      AFTER INSERT OR DELETE ON post_hashtags
+      FOR EACH ROW EXECUTE FUNCTION update_hashtag_post_count()
+    `);
+
+    logger.info('Feed upgrade migration applied');
+  } catch (err) {
+    logger.error('Feed upgrade migration error:', err.message || err);
+  }
+};
+
 // Start server only if not in Vercel environment
 if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
@@ -324,6 +477,8 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   runFeedMigrations();
   runSubscriptionMigrations();
   runLinkedinMigration();
+  runSearchMigration();
+  runFeedUpgradeMigration();
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
   const cleanupOldNotifications = async () => {
