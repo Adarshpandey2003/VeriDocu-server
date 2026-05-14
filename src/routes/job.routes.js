@@ -207,12 +207,10 @@ router.get('/', async (req, res) => {
     const countResult = await pool.query(countQuery, params);
     const total = countResult.rows[0]?.total || 0;
 
-    paramIndex++;
-    query += ` LIMIT $${paramIndex}`;
     params.push(limit);
-    paramIndex++;
-    query += ` OFFSET $${paramIndex}`;
+    query += ` LIMIT $${params.length}`;
     params.push(offset);
+    query += ` OFFSET $${params.length}`;
 
     const result = await pool.query(query, params);
 
