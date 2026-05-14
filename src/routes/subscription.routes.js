@@ -7,8 +7,25 @@ import { AppError } from '../middleware/errorHandler.js';
 
 const router = express.Router();
 
-const PLAN_AMOUNT = 49900; // 499 INR in paise
-const PLAN_CURRENCY = 'INR';
+const PLANS = {
+  candidate: {
+    pro:   { monthly: { amount: 29900,  name: 'VeriBoard Pro' },
+             yearly:  { amount: 249900, name: 'VeriBoard Pro Yearly' } },
+    elite: { monthly: { amount: 69900,  name: 'VeriBoard Elite' },
+             yearly:  { amount: 599900, name: 'VeriBoard Elite Yearly' } },
+  },
+  company: {
+    growth:     { monthly: { amount: 199900,  name: 'VeriBoard Growth' },
+                  yearly:  { amount: 1799900, name: 'VeriBoard Growth Yearly' } },
+    enterprise: { monthly: { amount: 699900,  name: 'VeriBoard Enterprise' },
+                  yearly:  { amount: 5999900, name: 'VeriBoard Enterprise Yearly' } },
+  },
+};
+
+const VALID_TIERS = {
+  candidate: ['pro', 'elite'],
+  company: ['growth', 'enterprise'],
+};
 
 function requireRazorpay(req, res, next) {
   if (!razorpay) {
@@ -17,77 +34,102 @@ function requireRazorpay(req, res, next) {
   next();
 }
 
-// Ensure Razorpay plan exists, create if not
-async function ensurePlan() {
-  if (process.env.RAZORPAY_PLAN_ID) return process.env.RAZORPAY_PLAN_ID;
-  try {
-    const plan = await razorpay.plans.create({
-      period: 'monthly',
-      interval: 1,
-      item: {
-        name: 'VeriBoard Pro',
-        amount: PLAN_AMOUNT,
-        currency: PLAN_CURRENCY,
-        description: 'Unlimited AI resume & cover letter generations',
-      },
-    });
-    process.env.RAZORPAY_PLAN_ID = plan.id;
-    console.log('[Razorpay] Created plan:', plan.id);
-    return plan.id;
-  } catch (err) {
-    console.error('[Razorpay] Plan creation failed:', err.message);
-    throw new AppError('Payment service unavailable', 503);
-  }
+async function ensurePlan(tier, billing) {
+  const cached = await pool.query(
+    'SELECT rzp_plan_id FROM razorpay_plans WHERE tier = $1 AND billing = $2',
+    [tier, billing]
+  );
+  if (cached.rows.length > 0) return cached.rows[0].rzp_plan_id;
+
+  const accountType = PLANS.candidate[tier] ? 'candidate' : 'company';
+  const planConfig = PLANS[accountType]?.[tier]?.[billing];
+  if (!planConfig) throw new AppError(`Invalid plan: ${tier}/${billing}`, 400);
+
+  const period = billing === 'yearly' ? 'yearly' : 'monthly';
+  const interval = 1;
+
+  const plan = await razorpay.plans.create({
+    period,
+    interval,
+    item: {
+      name: planConfig.name,
+      amount: planConfig.amount,
+      currency: 'INR',
+      description: `${planConfig.name} Subscription`,
+    },
+  });
+
+  await pool.query(
+    `INSERT INTO razorpay_plans (tier, billing, rzp_plan_id, amount)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (tier, billing) DO UPDATE SET rzp_plan_id = EXCLUDED.rzp_plan_id`,
+    [tier, billing, plan.id, planConfig.amount]
+  );
+
+  console.log(`[Razorpay] Created plan ${tier}/${billing}: ${plan.id}`);
+  return plan.id;
 }
 
-// POST /api/subscriptions/create — create a new subscription for the user
+// POST /api/subscriptions/create
 router.post('/create', protect, requireRazorpay, async (req, res, next) => {
   try {
-    // Check for existing active/authenticated subscription (not 'created' — those are abandoned checkouts)
+    const { tier, billing = 'monthly' } = req.body;
+    const accountType = req.user.account_type;
+
+    if (!tier || !VALID_TIERS[accountType]?.includes(tier)) {
+      return res.status(400).json({ success: false, message: `Invalid plan tier for ${accountType}.` });
+    }
+    if (!['monthly', 'yearly'].includes(billing)) {
+      return res.status(400).json({ success: false, message: 'Billing must be monthly or yearly.' });
+    }
+
     const existing = await pool.query(
       "SELECT id FROM subscriptions WHERE user_id = $1 AND status IN ('authenticated','active','pending') LIMIT 1",
       [req.user.id]
     );
     if (existing.rows.length > 0) {
-      return res.status(400).json({ success: false, message: 'You already have an active subscription.' });
+      return res.status(400).json({ success: false, message: 'You already have an active subscription. Cancel first to switch plans.' });
     }
 
-    // Clean up abandoned 'created' subscriptions so a new one can be made
     await pool.query(
       "DELETE FROM subscriptions WHERE user_id = $1 AND status = 'created'",
       [req.user.id]
     );
 
-    const planId = await ensurePlan();
+    const planId = await ensurePlan(tier, billing);
+    const totalCount = billing === 'yearly' ? 10 : 120;
 
     const subscription = await razorpay.subscriptions.create({
       plan_id: planId,
-      total_count: 120, // max billing cycles (10 years)
+      total_count: totalCount,
       customer_notify: 0,
-      notes: { user_id: req.user.id, email: req.user.email },
+      notes: { user_id: req.user.id, email: req.user.email, tier, billing },
     });
 
     await pool.query(
-      `INSERT INTO subscriptions (user_id, razorpay_subscription_id, razorpay_plan_id, status)
-       VALUES ($1, $2, $3, $4)`,
-      [req.user.id, subscription.id, planId, subscription.status]
+      `INSERT INTO subscriptions (user_id, razorpay_subscription_id, razorpay_plan_id, status, plan_tier, billing_cycle)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [req.user.id, subscription.id, planId, subscription.status, tier, billing]
     );
+
+    const planConfig = PLANS[accountType][tier][billing];
 
     res.json({
       success: true,
       subscriptionId: subscription.id,
       keyId: process.env.RAZORPAY_KEY_ID,
+      planName: planConfig.name,
     });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/subscriptions/status — get user's subscription info
+// GET /api/subscriptions/status
 router.get('/status', protect, async (req, res, next) => {
   try {
     const result = await pool.query(
-      `SELECT s.*, u.is_pro FROM subscriptions s
+      `SELECT s.*, u.is_pro, u.plan_tier, u.plan_billing FROM subscriptions s
        JOIN users u ON u.id = s.user_id
        WHERE s.user_id = $1
        ORDER BY s.created_at DESC LIMIT 1`,
@@ -95,16 +137,20 @@ router.get('/status', protect, async (req, res, next) => {
     );
 
     if (result.rows.length === 0) {
-      return res.json({ success: true, subscription: null, isPro: false });
+      return res.json({ success: true, subscription: null, isPro: false, planTier: 'free' });
     }
 
     const sub = result.rows[0];
     res.json({
       success: true,
-      isPro: !!sub.is_pro,
+      isPro: sub.plan_tier !== 'free',
+      planTier: sub.plan_tier || 'free',
+      planBilling: sub.plan_billing || null,
       subscription: {
         id: sub.razorpay_subscription_id,
         status: sub.status,
+        tier: sub.plan_tier,
+        billing: sub.billing_cycle,
         currentStart: sub.current_start,
         currentEnd: sub.current_end,
         createdAt: sub.created_at,
@@ -115,7 +161,7 @@ router.get('/status', protect, async (req, res, next) => {
   }
 });
 
-// POST /api/subscriptions/cancel — cancel at end of billing cycle
+// POST /api/subscriptions/cancel
 router.post('/cancel', protect, requireRazorpay, async (req, res, next) => {
   try {
     const result = await pool.query(
@@ -140,7 +186,7 @@ router.post('/cancel', protect, requireRazorpay, async (req, res, next) => {
   }
 });
 
-// POST /api/subscriptions/verify — verify payment after checkout (client-side callback)
+// POST /api/subscriptions/verify
 router.post('/verify', protect, async (req, res, next) => {
   try {
     const { razorpay_payment_id, razorpay_subscription_id, razorpay_signature } = req.body;
@@ -154,14 +200,23 @@ router.post('/verify', protect, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Payment verification failed.' });
     }
 
-    // Activate pro
-    await pool.query('UPDATE users SET is_pro = true WHERE id = $1', [req.user.id]);
+    const subResult = await pool.query(
+      'SELECT plan_tier, billing_cycle FROM subscriptions WHERE razorpay_subscription_id = $1',
+      [razorpay_subscription_id]
+    );
+    const tier = subResult.rows[0]?.plan_tier || 'pro';
+    const billing = subResult.rows[0]?.billing_cycle || 'monthly';
+
+    await pool.query(
+      "UPDATE users SET is_pro = true, plan_tier = $1, plan_billing = $2 WHERE id = $3",
+      [tier, billing, req.user.id]
+    );
     await pool.query(
       "UPDATE subscriptions SET status = 'active' WHERE razorpay_subscription_id = $1",
       [razorpay_subscription_id]
     );
 
-    res.json({ success: true, message: 'Payment verified. Pro activated!' });
+    res.json({ success: true, message: 'Payment verified. Plan activated!', planTier: tier });
   } catch (err) {
     next(err);
   }
@@ -178,7 +233,6 @@ router.post('/webhook', async (req, res) => {
       return res.status(500).json({ status: 'error' });
     }
 
-    // req.body is a raw Buffer because we register express.raw() for this route
     const rawBody = typeof req.body === 'string' ? req.body : req.body.toString('utf8');
 
     const expected = crypto
@@ -202,9 +256,8 @@ router.post('/webhook', async (req, res) => {
     const rzpSubId = payload.id;
     console.log(`[Webhook] ${eventType} for subscription ${rzpSubId}`);
 
-    // Find the subscription in our DB
     const subResult = await pool.query(
-      'SELECT id, user_id FROM subscriptions WHERE razorpay_subscription_id = $1',
+      'SELECT id, user_id, plan_tier, billing_cycle FROM subscriptions WHERE razorpay_subscription_id = $1',
       [rzpSubId]
     );
 
@@ -213,7 +266,7 @@ router.post('/webhook', async (req, res) => {
       return res.json({ status: 'ok' });
     }
 
-    const { id: subDbId, user_id: userId } = subResult.rows[0];
+    const { id: subDbId, user_id: userId, plan_tier: tier, billing_cycle: billing } = subResult.rows[0];
 
     switch (eventType) {
       case 'subscription.activated':
@@ -224,9 +277,11 @@ router.post('/webhook', async (req, res) => {
            WHERE id = $3`,
           [payload.current_start, payload.current_end, subDbId]
         );
-        await pool.query('UPDATE users SET is_pro = true WHERE id = $1', [userId]);
+        await pool.query(
+          "UPDATE users SET is_pro = true, plan_tier = $1, plan_billing = $2 WHERE id = $3",
+          [tier, billing, userId]
+        );
 
-        // Record payment if present
         const paymentEntity = event.payload?.payment?.entity;
         if (paymentEntity) {
           await pool.query(
@@ -245,7 +300,10 @@ router.post('/webhook', async (req, res) => {
         await pool.query('UPDATE subscriptions SET status = $1 WHERE id = $2', [
           eventType.replace('subscription.', ''), subDbId
         ]);
-        await pool.query('UPDATE users SET is_pro = false WHERE id = $1', [userId]);
+        await pool.query(
+          "UPDATE users SET is_pro = false, plan_tier = 'free', plan_billing = NULL WHERE id = $1",
+          [userId]
+        );
         break;
       }
 
@@ -255,7 +313,10 @@ router.post('/webhook', async (req, res) => {
         await pool.query('UPDATE subscriptions SET status = $1 WHERE id = $2', [
           eventType.replace('subscription.', ''), subDbId
         ]);
-        await pool.query('UPDATE users SET is_pro = false WHERE id = $1', [userId]);
+        await pool.query(
+          "UPDATE users SET is_pro = false, plan_tier = 'free', plan_billing = NULL WHERE id = $1",
+          [userId]
+        );
         break;
       }
     }
@@ -265,6 +326,61 @@ router.post('/webhook', async (req, res) => {
     console.error('[Webhook] Error:', err.message);
     res.status(500).json({ status: 'error' });
   }
+});
+
+// GET /api/subscriptions/plans — public plan info
+router.get('/plans', async (req, res) => {
+  res.json({
+    success: true,
+    plans: {
+      candidate: {
+        free: {
+          name: 'Starter', price: 0, features: [
+            'Apply to verified jobs', 'Basic profile visibility', 'Limited job recommendations',
+            '1 resume generation/month', '2 cover letters/month',
+          ],
+        },
+        pro: {
+          name: 'Pro', monthly: 299, yearly: 2499, features: [
+            'Top priority in job recommendations', 'Highly relevant job matching',
+            '5 resume generations/month', '5 cover letters/month',
+            'Priority visibility to recruiters', 'Basic profile insights',
+          ],
+        },
+        elite: {
+          name: 'Elite', monthly: 699, yearly: 5999, features: [
+            'All Pro features', 'See who viewed your profile',
+            '30 resume generations/month', '30 cover letters/month',
+            'AI resume & profile optimization', 'Instant alerts for high-match jobs',
+            '"Verified Pro Candidate" badge',
+          ],
+        },
+      },
+      company: {
+        free: {
+          name: 'Basic', price: 0, features: [
+            'Post 1 active job', 'Access limited candidate profiles',
+            'Basic verification status', 'Standard listing visibility',
+          ],
+        },
+        growth: {
+          name: 'Growth', monthly: 1999, yearly: 17999, features: [
+            'Up to 5 active job postings', 'Access to verified candidate pool',
+            'Higher job visibility', 'Basic analytics',
+            'Limited candidate messaging', 'Company verification badge',
+          ],
+        },
+        enterprise: {
+          name: 'Enterprise', monthly: 6999, yearly: 59999, contactSales: true, features: [
+            'Unlimited job postings', 'Priority placement in job feeds',
+            'Full access to verified candidate database', 'Unlimited candidate messaging',
+            'Advanced analytics', 'Fast-track verification requests',
+            '"Top Verified Company" badge', 'Dedicated support',
+          ],
+        },
+      },
+    },
+  });
 });
 
 export default router;

@@ -9,8 +9,35 @@ import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { uploadToBucket, BUCKET_NAME } from '../utils/supabaseStorage.js';
+import { callOpenAI } from '../services/aiService.js';
 
 const router = express.Router();
+
+const GENERATION_LIMITS = {
+  free:   { resume: 1,  coverLetter: 2 },
+  pro:    { resume: 5,  coverLetter: 5 },
+  elite:  { resume: 30, coverLetter: 30 },
+};
+
+async function checkAndResetMonthly(userId) {
+  const result = await pool.query(
+    'SELECT plan_tier, resume_generation_count, cover_letter_generation_count, generation_reset_at FROM users WHERE id = $1',
+    [userId]
+  );
+  const u = result.rows[0];
+  const resetAt = u.generation_reset_at ? new Date(u.generation_reset_at) : new Date(0);
+  const now = new Date();
+  const needsReset = resetAt.getFullYear() !== now.getFullYear() || resetAt.getMonth() !== now.getMonth();
+
+  if (needsReset) {
+    await pool.query(
+      'UPDATE users SET resume_generation_count = 0, cover_letter_generation_count = 0, generation_reset_at = NOW() WHERE id = $1',
+      [userId]
+    );
+    return { ...u, resume_generation_count: 0, cover_letter_generation_count: 0, plan_tier: u.plan_tier || 'free' };
+  }
+  return { ...u, plan_tier: u.plan_tier || 'free' };
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -116,17 +143,15 @@ router.post(
   validate,
   async (req, res, next) => {
     try {
-      // Free-tier limit: 1 resume generation
-      const limCheck = await pool.query(
-        'SELECT is_pro, resume_generation_count FROM users WHERE id = $1',
-        [req.user.id]
-      );
-      const limUser = limCheck.rows[0];
-      if (!limUser.is_pro && (limUser.resume_generation_count || 0) >= 1) {
+      const limUser = await checkAndResetMonthly(req.user.id);
+      const tier = limUser.plan_tier;
+      const limits = GENERATION_LIMITS[tier] || GENERATION_LIMITS.free;
+      if ((limUser.resume_generation_count || 0) >= limits.resume) {
         return res.status(403).json({
           success: false,
-          message: 'Free plan allows 1 resume generation. Upgrade to Pro for unlimited access.',
-          code: 'PRO_REQUIRED',
+          message: `Your ${tier === 'free' ? 'free' : tier} plan allows ${limits.resume} resume generation${limits.resume > 1 ? 's' : ''}/month. Upgrade for more.`,
+          code: 'LIMIT_REACHED',
+          planTier: tier,
         });
       }
 
@@ -195,43 +220,18 @@ ${resumeStr}
 
 Generate the complete LaTeX resume now.`;
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 60000);
-
-      let aiResponse;
+      let latex;
       try {
-        aiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            max_tokens: 4096,
-            temperature: 0.3,
-          }),
-          signal: controller.signal,
+        latex = await callOpenAI({
+          system: systemPrompt,
+          user: userPrompt,
+          maxTokens: 4096,
+          temperature: 0.3,
         });
-      } finally {
-        clearTimeout(timer);
+      } catch (err) {
+        console.error('OpenAI resume generation error:', err.message);
+        return next(new AppError('AI generation failed. Please try again.', 502));
       }
-
-      if (!aiResponse.ok) {
-        const errBody = await aiResponse.json().catch(() => ({}));
-        console.error('Sarvam AI error:', errBody);
-        return next(new AppError('AI generation failed. Check SARVAM_API_KEY and try again.', 502));
-      }
-
-      const aiResult = await aiResponse.json();
-      let latex = aiResult.choices?.[0]?.message?.content ?? '';
-
-      // Strip chain-of-thought <think> blocks emitted by reasoning models (e.g. sarvam-m)
-      latex = latex.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
       // Strip any accidental markdown fences
       latex = latex
@@ -420,18 +420,17 @@ router.post(
 // ── Generation status (free-tier limits) ──────────────────────────────────
 router.get('/generation-status', protect, async (req, res, next) => {
   try {
-    const result = await pool.query(
-      'SELECT is_pro, resume_generation_count, cover_letter_generation_count FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    const u = result.rows[0];
+    const u = await checkAndResetMonthly(req.user.id);
+    const tier = u.plan_tier;
+    const limits = GENERATION_LIMITS[tier] || GENERATION_LIMITS.free;
     res.json({
       success: true,
-      isPro: !!u.is_pro,
+      isPro: tier !== 'free',
+      planTier: tier,
       resumeCount: u.resume_generation_count || 0,
       coverLetterCount: u.cover_letter_generation_count || 0,
-      resumeLimit: u.is_pro ? null : 1,
-      coverLetterLimit: u.is_pro ? null : 1,
+      resumeLimit: limits.resume,
+      coverLetterLimit: limits.coverLetter,
     });
   } catch (err) {
     next(err);
@@ -516,17 +515,15 @@ router.post(
   validate,
   async (req, res, next) => {
     try {
-      // Free-tier limit: 1 cover letter generation
-      const limCheck = await pool.query(
-        'SELECT is_pro, cover_letter_generation_count FROM users WHERE id = $1',
-        [req.user.id]
-      );
-      const limUser = limCheck.rows[0];
-      if (!limUser.is_pro && (limUser.cover_letter_generation_count || 0) >= 1) {
+      const limUser = await checkAndResetMonthly(req.user.id);
+      const tier = limUser.plan_tier;
+      const limits = GENERATION_LIMITS[tier] || GENERATION_LIMITS.free;
+      if ((limUser.cover_letter_generation_count || 0) >= limits.coverLetter) {
         return res.status(403).json({
           success: false,
-          message: 'Free plan allows 1 cover letter generation. Upgrade to Pro for unlimited access.',
-          code: 'PRO_REQUIRED',
+          message: `Your ${tier === 'free' ? 'free' : tier} plan allows ${limits.coverLetter} cover letter${limits.coverLetter > 1 ? 's' : ''}/month. Upgrade for more.`,
+          code: 'LIMIT_REACHED',
+          planTier: tier,
         });
       }
 
@@ -562,41 +559,18 @@ ${resumeStr}
 
 Write the cover letter now.`;
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 60000);
-
-      let aiResponse;
+      let coverLetter;
       try {
-        aiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            max_tokens: 1024,
-            temperature: 0.5,
-          }),
-          signal: controller.signal,
+        coverLetter = await callOpenAI({
+          system: systemPrompt,
+          user: userPrompt,
+          maxTokens: 1024,
+          temperature: 0.5,
         });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      if (!aiResponse.ok) {
+      } catch (err) {
+        console.error('OpenAI cover letter error:', err.message);
         return next(new AppError('AI generation failed. Please try again.', 502));
       }
-
-      const aiResult = await aiResponse.json();
-      let coverLetter = aiResult.choices?.[0]?.message?.content ?? '';
-
-      // Strip chain-of-thought <think> blocks emitted by reasoning models
-      coverLetter = coverLetter.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
       if (!coverLetter) {
         return next(new AppError('AI returned empty response. Please try again.', 502));

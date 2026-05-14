@@ -40,6 +40,10 @@ import cmsRoutes from './routes/cms.routes.js';
 import adminCmsRoutes from './routes/admin-cms.routes.js';
 import feedRoutes from './routes/feed.routes.js';
 import subscriptionRoutes from './routes/subscription.routes.js';
+import collaboratorRoutes from './routes/collaborators.routes.js';
+import bulkOnboardRoutes from './routes/bulk-onboard.routes.js';
+import interviewRoutes from './routes/interview.routes.js';
+import hrFeatureRoutes from './routes/hr-features.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -143,6 +147,10 @@ app.use('/api/cms', cmsRoutes);
 app.use('/api/resume', resumeRoutes);
 app.use('/api/feed', feedRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api', collaboratorRoutes);
+app.use('/api/company', bulkOnboardRoutes);
+app.use('/api/interviews', interviewRoutes);
+app.use('/api', hrFeatureRoutes);
 
 // Development-only debug routes removed
 
@@ -465,6 +473,93 @@ const runFeedUpgradeMigration = async () => {
   }
 };
 
+// Auto-migrate: multi-tier plan system
+const runPlanMigration = async () => {
+  try {
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_tier VARCHAR(20) NOT NULL DEFAULT 'free'");
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_billing VARCHAR(10) DEFAULT NULL');
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS generation_reset_at TIMESTAMPTZ DEFAULT NOW()');
+    await pool.query("UPDATE users SET plan_tier = 'pro' WHERE is_pro = true AND plan_tier = 'free'");
+    await pool.query("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_tier VARCHAR(20) DEFAULT 'pro'");
+    await pool.query("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS billing_cycle VARCHAR(10) DEFAULT 'monthly'");
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS razorpay_plans (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tier       VARCHAR(20) NOT NULL,
+        billing    VARCHAR(10) NOT NULL,
+        rzp_plan_id TEXT NOT NULL UNIQUE,
+        amount     INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(tier, billing)
+      )
+    `);
+    logger.info('Plan tier migration applied');
+  } catch (err) {
+    logger.error('Plan tier migration error:', err.message || err);
+  }
+};
+
+const runHrFeaturesMigration = async () => {
+  try {
+    // AI screening columns on job_applications
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS ai_score INT');
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS ai_summary TEXT');
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS ai_strengths TEXT[]');
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS ai_concerns TEXT[]');
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS ai_screened_at TIMESTAMPTZ');
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS ai_interview_questions JSONB');
+    await pool.query('ALTER TABLE job_applications ADD COLUMN IF NOT EXISTS internal_notes TEXT');
+
+    // AI screening config on jobs
+    await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_screening_enabled BOOLEAN DEFAULT FALSE');
+    await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ai_min_score INT');
+
+    // Job collaborators table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS job_collaborators (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        email TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('co_owner','recruiter','reviewer')),
+        invited_by_user_id UUID NOT NULL REFERENCES users(id),
+        magic_token UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+        accepted_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(job_id, email)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_job_collab_user ON job_collaborators(user_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_job_collab_token ON job_collaborators(magic_token)');
+
+    // Interview invites table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS interview_invites (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        application_id UUID NOT NULL REFERENCES job_applications(id) ON DELETE CASCADE,
+        proposed_slots JSONB NOT NULL,
+        selected_slot_index INT,
+        mode TEXT NOT NULL CHECK (mode IN ('video','phone','in_person')),
+        meeting_link TEXT,
+        location TEXT,
+        notes TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','confirmed','cancelled','completed','no_show')),
+        magic_token UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+        created_by_user_id UUID NOT NULL REFERENCES users(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_interview_app ON interview_invites(application_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_interview_token ON interview_invites(magic_token)');
+
+    logger.info('HR features migration applied');
+  } catch (err) {
+    logger.error('HR features migration error:', err.message || err);
+  }
+};
+
 // Start server only if not in Vercel environment
 if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
@@ -479,6 +574,8 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   runLinkedinMigration();
   runSearchMigration();
   runFeedUpgradeMigration();
+  runPlanMigration();
+  runHrFeaturesMigration();
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
   const cleanupOldNotifications = async () => {

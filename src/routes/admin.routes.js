@@ -221,7 +221,10 @@ router.get('/verifications/stats', async (req, res, next) => {
 // @access  Admin only
 router.get('/employments', async (req, res, next) => {
   try {
-    const { status, verificationType } = req.query;
+    const { status, verificationType, page: pageRaw, limit: limitRaw, search } = req.query;
+    const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(limitRaw, 10) || 20));
+    const offset = (page - 1) * limit;
 
     // Build stats query
     const statsQuery = `
@@ -266,10 +269,27 @@ router.get('/employments', async (req, res, next) => {
       whereConditions.push(`eh.verification_type = 'manual'`);
     }
 
+    if (search && search.trim()) {
+      whereConditions.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex} OR eh.company_name ILIKE $${paramIndex} OR eh.position ILIKE $${paramIndex})`);
+      queryParams.push(`%${search.trim()}%`);
+      paramIndex++;
+    }
+
     const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
 
+    // Count for pagination
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM employment_history eh
+      JOIN candidates cand ON eh.candidate_id = cand.id
+      JOIN users u ON cand.user_id = u.id
+      ${whereClause}
+    `;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = countResult.rows[0]?.total || 0;
+
     const employmentsQuery = `
-      SELECT 
+      SELECT
         eh.id,
         eh.company_name,
         eh.company_id,
@@ -292,7 +312,9 @@ router.get('/employments', async (req, res, next) => {
       LEFT JOIN companies comp ON eh.company_id = comp.id
       ${whereClause}
       ORDER BY eh.created_at DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
     `;
+    queryParams.push(limit, offset);
 
     const employmentsResult = await pool.query(employmentsQuery, queryParams);
 
@@ -380,6 +402,13 @@ router.get('/employments', async (req, res, next) => {
           avatarUrl,
         };
       })),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: page * limit < total,
+      },
     });
   } catch (error) {
     next(error);
@@ -498,7 +527,10 @@ router.post('/employments/:id/reject', async (req, res, next) => {
 // @access  Admin only
 router.get('/companies', async (req, res, next) => {
   try {
-    const { status } = req.query;
+    const { status, page: pageRaw, limit: limitRaw, search } = req.query;
+    const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(limitRaw, 10) || 20));
+    const offset = (page - 1) * limit;
 
     // Build stats query - use companies table for verification status
     const statsQuery = `
@@ -537,10 +569,21 @@ router.get('/companies', async (req, res, next) => {
       }
     }
 
+    if (search && search.trim()) {
+      whereConditions.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex} OR c.name ILIKE $${paramIndex})`);
+      queryParams.push(`%${search.trim()}%`);
+      paramIndex++;
+    }
+
     const whereClause = `WHERE ${whereConditions.join(' AND ')}`;
 
+    // Count for pagination
+    const countQuery = `SELECT COUNT(*)::int AS total FROM users u LEFT JOIN companies c ON u.id = c.user_id ${whereClause}`;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = countResult.rows[0]?.total || 0;
+
     const companiesQuery = `
-      SELECT 
+      SELECT
         u.id,
         u.email,
         u.name,
@@ -559,7 +602,9 @@ router.get('/companies', async (req, res, next) => {
       LEFT JOIN companies c ON u.id = c.user_id
       ${whereClause}
       ORDER BY u.created_at DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
     `;
+    queryParams.push(limit, offset);
 
     const companiesResult = await pool.query(companiesQuery, queryParams);
 
@@ -627,6 +672,13 @@ router.get('/companies', async (req, res, next) => {
       success: true,
       stats,
       companies,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: page * limit < total,
+      },
     });
   } catch (error) {
     next(error);
@@ -1190,10 +1242,53 @@ router.get('/verifications/:type/:id/comments', async (req, res, next) => {
 // @access  Admin only
 router.get('/educations', async (req, res, next) => {
   try {
-    const { status } = req.query;
+    const { status, page: pageRaw, limit: limitRaw, search } = req.query;
+    const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(limitRaw, 10) || 20));
+    const offset = (page - 1) * limit;
 
-    let query = `
-      SELECT 
+    // Stats query (always over the full table, not affected by pagination)
+    const statsResult = await pool.query(`
+      SELECT
+        COUNT(*)::int as total,
+        COUNT(CASE WHEN verification_status = 'pending' OR verification_status IS NULL THEN 1 END)::int as pending,
+        COUNT(CASE WHEN verification_status = 'verified' THEN 1 END)::int as verified,
+        COUNT(CASE WHEN verification_status = 'rejected' THEN 1 END)::int as rejected
+      FROM education_history
+    `);
+    const stats = statsResult.rows[0];
+
+    const whereConditions = [];
+    const queryParams = [];
+    let paramIndex = 1;
+
+    if (status && status !== 'all') {
+      whereConditions.push(`eh.verification_status = $${paramIndex}`);
+      queryParams.push(status);
+      paramIndex++;
+    }
+
+    if (search && search.trim()) {
+      whereConditions.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex} OR eh.institution ILIKE $${paramIndex} OR eh.degree ILIKE $${paramIndex})`);
+      queryParams.push(`%${search.trim()}%`);
+      paramIndex++;
+    }
+
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    // Count for pagination
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM education_history eh
+      JOIN candidates c ON eh.candidate_id = c.id
+      JOIN users u ON c.user_id = u.id
+      ${whereClause}
+    `;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = countResult.rows[0]?.total || 0;
+
+    const query = `
+      SELECT
         eh.id,
         eh.candidate_id,
         eh.institution,
@@ -1216,15 +1311,11 @@ router.get('/educations', async (req, res, next) => {
       FROM education_history eh
       JOIN candidates c ON eh.candidate_id = c.id
       JOIN users u ON c.user_id = u.id
+      ${whereClause}
+      ORDER BY eh.created_at DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
     `;
-
-    const queryParams = [];
-    if (status && status !== 'all') {
-      query += ` WHERE eh.verification_status = $1`;
-      queryParams.push(status);
-    }
-
-    query += ` ORDER BY eh.created_at DESC`;
+    queryParams.push(limit, offset);
 
     const result = await pool.query(query, queryParams);
 
@@ -1292,7 +1383,15 @@ router.get('/educations', async (req, res, next) => {
 
     res.json({
       success: true,
+      stats,
       educations,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: page * limit < total,
+      },
     });
   } catch (error) {
     next(error);

@@ -2,6 +2,9 @@ import express from 'express';
 import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { deleteFromBucket, BUCKET_NAME, createSignedUrl, signImageUrl } from '../utils/supabaseStorage.js';
+import { AppError } from '../middleware/errorHandler.js';
+
+const JOB_POST_LIMITS = { free: 1, growth: 5, enterprise: Infinity };
 
 const router = express.Router();
 
@@ -76,7 +79,9 @@ router.get('/', async (req, res) => {
       employmentType,
       companyId,
       topCompaniesOnly,
-      sortBy = 'recent' // recent, salary-high, salary-low, company
+      sortBy = 'recent', // recent, salary-high, salary-low, company
+      page: pageRaw,
+      limit: limitRaw,
     } = req.query;
 
     // Debug logging removed to keep logs clean in production
@@ -190,7 +195,25 @@ router.get('/', async (req, res) => {
         query += ` ORDER BY j.created_at DESC`;
     }
 
-    // Execute query
+    // Pagination
+    const page = Math.max(1, parseInt(pageRaw, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(limitRaw, 10) || 12));
+    const offset = (page - 1) * limit;
+
+    // Count query (same filters but no ORDER/LIMIT)
+    const countQuery = `SELECT COUNT(*)::int AS total FROM jobs j JOIN companies c ON j.company_id = c.id WHERE j.is_active = true${
+      query.split('WHERE j.is_active = true')[1].split(/ ORDER BY /i)[0]
+    }`;
+    const countResult = await pool.query(countQuery, params);
+    const total = countResult.rows[0]?.total || 0;
+
+    paramIndex++;
+    query += ` LIMIT $${paramIndex}`;
+    params.push(limit);
+    paramIndex++;
+    query += ` OFFSET $${paramIndex}`;
+    params.push(offset);
+
     const result = await pool.query(query, params);
 
   // Removed verbose result count log
@@ -239,7 +262,14 @@ router.get('/', async (req, res) => {
         companies: companiesResult.rows,
         employmentTypes: ['full-time', 'part-time', 'contract', 'internship']
       },
-      total: result.rows.length
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasMore: page * limit < total,
+      },
+      total,
     });
   } catch (error) {
     console.error('Error fetching jobs:', error);
@@ -252,32 +282,36 @@ router.get('/', async (req, res) => {
 // @access  Private (Company only)
 router.get('/company/my-jobs', protect, async (req, res) => {
   try {
-    // Verify user is a company
-    if (req.user.account_type !== 'company') {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Access denied. Only companies can access this endpoint.' 
-      });
+    const isCompany = req.user.account_type === 'company';
+    let whereClause;
+    let params;
+
+    if (isCompany) {
+      const companyResult = await pool.query(
+        'SELECT id FROM companies WHERE user_id = $1',
+        [req.user.id]
+      );
+      if (companyResult.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Company profile not found.' });
+      }
+      whereClause = 'j.company_id = $1';
+      params = [companyResult.rows[0].id];
+    } else {
+      // Collaborator: show jobs they have accepted access to
+      const collabRes = await pool.query(
+        `SELECT job_id FROM job_collaborators WHERE user_id = $1 AND accepted_at IS NOT NULL`,
+        [req.user.id]
+      );
+      const jobIds = collabRes.rows.map((r) => r.job_id);
+      if (jobIds.length === 0) {
+        return res.json({ success: true, jobs: [] });
+      }
+      whereClause = 'j.id = ANY($1::uuid[])';
+      params = [jobIds];
     }
 
-    // Get company_id for this user
-    const companyResult = await pool.query(
-      'SELECT id FROM companies WHERE user_id = $1',
-      [req.user.id]
-    );
-
-    if (companyResult.rows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Company profile not found.' 
-      });
-    }
-
-    const companyId = companyResult.rows[0].id;
-
-    // Get all jobs for this company with application and view counts
     const result = await pool.query(`
-      SELECT 
+      SELECT
         j.*,
         COALESCE(app_count.count, 0) as applications_count,
         COALESCE(view_count.count, 0) as views_count
@@ -292,9 +326,9 @@ router.get('/company/my-jobs', protect, async (req, res) => {
         FROM job_views
         GROUP BY job_id
       ) view_count ON j.id = view_count.job_id
-      WHERE j.company_id = $1
+      WHERE ${whereClause}
       ORDER BY j.created_at DESC
-    `, [companyId]);
+    `, params);
 
     res.json({
       success: true,
@@ -346,23 +380,38 @@ router.post('/', protect, async (req, res) => {
 
     const companyId = companyResult.rows[0].id;
 
-    const { 
-      title, 
-      description, 
-      requirements, 
-      required_skills, 
-      benefits, 
-      location, 
-      employment_type, 
-      salary_min, 
+    const planTier = req.user.plan_tier || 'free';
+    const maxJobs = JOB_POST_LIMITS[planTier] ?? JOB_POST_LIMITS.free;
+    if (maxJobs !== Infinity) {
+      const activeCount = await pool.query(
+        'SELECT COUNT(*)::int AS cnt FROM jobs WHERE company_id = $1 AND is_active = true',
+        [companyId]
+      );
+      if (activeCount.rows[0].cnt >= maxJobs) {
+        return res.status(403).json({
+          success: false,
+          message: `Your ${planTier === 'free' ? 'Basic' : planTier.charAt(0).toUpperCase() + planTier.slice(1)} plan allows up to ${maxJobs} active job posting${maxJobs > 1 ? 's' : ''}. Upgrade your plan to post more jobs.`,
+          limitReached: true,
+          currentCount: activeCount.rows[0].cnt,
+          limit: maxJobs,
+        });
+      }
+    }
+
+    const {
+      title,
+      description,
+      requirements,
+      required_skills,
+      benefits,
+      location,
+      employment_type,
+      salary_min,
       salary_max,
       application_form,
       resume_required
     } = req.body;
 
-    // Removed verbose creation log
-
-    // Validate required fields
     if (!title || !description || !location) {
       return res.status(400).json({ 
         success: false, 
@@ -733,32 +782,50 @@ router.get('/', async (req, res) => {
 // @access  Private (Company only)
 router.get('/company/applicants', protect, async (req, res) => {
   try {
-    // Verify user is a company
-    if (req.user.account_type !== 'company') {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Access denied. Only companies can access applicants.' 
-      });
-    }
-
-    // Get company_id for this user
-    const companyResult = await pool.query(
-      'SELECT id FROM companies WHERE user_id = $1',
-      [req.user.id]
-    );
-
-    if (companyResult.rows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Company profile not found.' 
-      });
-    }
-
-    const companyId = companyResult.rows[0].id;
     const { job_id, status } = req.query;
+    const isCompany = req.user.account_type === 'company';
+
+    // Determine job_id scope: company owner sees their jobs, collaborator sees jobs they have access to
+    let companyId = null;
+    let accessibleJobIds = null; // null = no filter, [] = no access, [...ids] = specific
+
+    if (isCompany) {
+      const companyResult = await pool.query(
+        'SELECT id FROM companies WHERE user_id = $1',
+        [req.user.id]
+      );
+      if (companyResult.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Company profile not found.' });
+      }
+      companyId = companyResult.rows[0].id;
+
+      // If they pass a specific job_id, verify they own it OR are a collaborator on it
+      if (job_id) {
+        const { getJobAccess } = await import('../utils/jobAccess.js');
+        const access = await getJobAccess(req.user.id, job_id);
+        if (!access.allowed) {
+          return res.status(403).json({ success: false, message: 'Not authorized for this job' });
+        }
+      }
+    } else {
+      // Non-company user: must be a collaborator on at least one job
+      const collabRes = await pool.query(
+        `SELECT job_id FROM job_collaborators
+         WHERE user_id = $1 AND accepted_at IS NOT NULL`,
+        [req.user.id]
+      );
+      accessibleJobIds = collabRes.rows.map((r) => r.job_id);
+      if (accessibleJobIds.length === 0) {
+        return res.json({ success: true, applicants: [] });
+      }
+      // If they pass a specific job_id, ensure they have access to it
+      if (job_id && !accessibleJobIds.includes(job_id)) {
+        return res.status(403).json({ success: false, message: 'Not authorized for this job' });
+      }
+    }
 
     let query = `
-      SELECT 
+      SELECT
         ja.id,
         ja.job_id,
         ja.status,
@@ -766,6 +833,8 @@ router.get('/company/applicants', protect, async (req, res) => {
         ja.updated_at,
         ja.cover_letter,
         ja.resume_url,
+        ja.ai_score,
+        ja.ai_summary,
         j.title as job_title,
         j.id as job_id,
         u.id as user_id,
@@ -779,12 +848,21 @@ router.get('/company/applicants', protect, async (req, res) => {
       JOIN jobs j ON ja.job_id = j.id
       JOIN users u ON ja.user_id = u.id
       LEFT JOIN candidates c ON ja.candidate_id = c.id
-      WHERE j.company_id = $1
-        AND ja.status != 'withdrawn'
+      WHERE ja.status != 'withdrawn'
     `;
 
-    const params = [companyId];
-    let paramIndex = 1;
+    const params = [];
+    let paramIndex = 0;
+
+    if (isCompany) {
+      paramIndex++;
+      query += ` AND j.company_id = $${paramIndex}`;
+      params.push(companyId);
+    } else {
+      paramIndex++;
+      query += ` AND j.id = ANY($${paramIndex}::uuid[])`;
+      params.push(accessibleJobIds);
+    }
 
     if (job_id) {
       paramIndex++;
@@ -877,29 +955,28 @@ router.get('/company/applicants', protect, async (req, res) => {
 // @access  Private (Company only)
 router.get('/company/applicants/:applicationId', protect, async (req, res) => {
   try {
-    if (req.user.account_type !== 'company') {
-      return res.status(403).json({ success: false, message: 'Access denied. Only companies can access applicants.' });
-    }
-
     const { applicationId } = req.params;
 
-    // Get company_id for this user
-    const companyResult = await pool.query(
-      'SELECT id FROM companies WHERE user_id = $1',
-      [req.user.id]
+    // Look up the application's job, then check access via getJobAccess
+    const jobLookup = await pool.query(
+      'SELECT job_id FROM job_applications WHERE id = $1',
+      [applicationId]
     );
+    if (jobLookup.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Application not found.' });
+    }
+    const jobId = jobLookup.rows[0].job_id;
 
-    if (companyResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Company profile not found.' });
+    const { getJobAccess } = await import('../utils/jobAccess.js');
+    const access = await getJobAccess(req.user.id, jobId);
+    if (!access.allowed) {
+      return res.status(403).json({ success: false, message: 'Not authorized for this application' });
     }
 
-    const companyId = companyResult.rows[0].id;
-
-    // Fetch the application and ensure it belongs to a job owned by this company
     const result = await pool.query(`
-      SELECT 
-        ja.*, 
-        j.title as job_title, 
+      SELECT
+        ja.*,
+        j.title as job_title,
         j.id as job_id,
         j.application_form as job_application_form,
         j.resume_required as job_resume_required,
@@ -915,9 +992,9 @@ router.get('/company/applicants/:applicationId', protect, async (req, res) => {
       JOIN jobs j ON ja.job_id = j.id
       JOIN users u ON ja.user_id = u.id
       LEFT JOIN candidates c ON ja.candidate_id = c.id
-      WHERE ja.id = $1 AND j.company_id = $2
+      WHERE ja.id = $1
       LIMIT 1
-    `, [applicationId, companyId]);
+    `, [applicationId]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Application not found or you do not have permission to view it.' });
@@ -1042,45 +1119,20 @@ router.put('/applications/:applicationId/status', protect, async (req, res) => {
     const { applicationId } = req.params;
     const { status, notes } = req.body;
 
-    // Verify user is a company
-    if (req.user.account_type !== 'company') {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Access denied. Only companies can update application status.' 
-      });
-    }
-
-    // NOTE: Do not hard-code the allowed statuses here because the
-    // database enforces a check constraint. We'll attempt the update and
-    // surface any DB constraint errors to the client with a helpful message.
-
-    // Get company_id for this user
-    const companyResult = await pool.query(
-      'SELECT id FROM companies WHERE user_id = $1',
-      [req.user.id]
+    // Authorize via job access (owner OR collaborator with manage_applicants permission)
+    const jobLookup = await pool.query(
+      'SELECT job_id FROM job_applications WHERE id = $1',
+      [applicationId]
     );
-
-    if (companyResult.rows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Company profile not found.' 
-      });
+    if (jobLookup.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Application not found.' });
     }
-
-    const companyId = companyResult.rows[0].id;
-
-    // Verify the application belongs to a job owned by this company
-    const checkResult = await pool.query(`
-      SELECT ja.id 
-      FROM job_applications ja
-      JOIN jobs j ON ja.job_id = j.id
-      WHERE ja.id = $1 AND j.company_id = $2
-    `, [applicationId, companyId]);
-
-    if (checkResult.rows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Application not found or you do not have permission to update it.' 
+    const { getJobAccess } = await import('../utils/jobAccess.js');
+    const access = await getJobAccess(req.user.id, jobLookup.rows[0].job_id);
+    if (!access.allowed || !access.perms.manage_applicants) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have permission to update applications for this job.',
       });
     }
 
@@ -1355,11 +1407,69 @@ router.post('/:id/apply', protect, async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
       RETURNING *
     `, [id, candidateId, userId, coverLetter, applicationAnswersJson, resumeUrl]);
-    
-    res.json({ 
-      success: true, 
+
+    const application = result.rows[0];
+
+    // Hybrid AI screening: auto-screen for paid-tier companies if enabled on the job
+    setImmediate(async () => {
+      try {
+        const cfgRes = await pool.query(
+          `SELECT j.ai_screening_enabled, u.plan_tier
+           FROM jobs j
+           JOIN companies c ON j.company_id = c.id
+           JOIN users u ON c.user_id = u.id
+           WHERE j.id = $1`,
+          [id]
+        );
+        const cfg = cfgRes.rows[0];
+        if (!cfg || !cfg.ai_screening_enabled) return;
+        if (!['growth', 'enterprise'].includes(cfg.plan_tier)) return;
+
+        const { screenResume } = await import('../services/aiService.js');
+        const { default: routerInternal } = await import('./hr-features.routes.js'); // not needed; just build text
+        // Build resume text using a lightweight inline query
+        const ctxRes = await pool.query(
+          `SELECT ja.cover_letter, c.full_name, c.bio, c.skills, c.professional_title,
+                  j.title AS job_title, j.description AS job_description, j.required_skills
+           FROM job_applications ja
+           JOIN jobs j ON ja.job_id = j.id
+           LEFT JOIN candidates c ON ja.candidate_id = c.id
+           WHERE ja.id = $1`,
+          [application.id]
+        );
+        const r = ctxRes.rows[0];
+        if (!r) return;
+        const resumeText = [
+          r.full_name ? `Name: ${r.full_name}` : '',
+          r.professional_title ? `Title: ${r.professional_title}` : '',
+          r.bio ? `\nBio: ${r.bio}` : '',
+          Array.isArray(r.skills) && r.skills.length ? `\nSkills: ${r.skills.join(', ')}` : '',
+          r.cover_letter ? `\nCover Letter:\n${r.cover_letter}` : '',
+        ].filter(Boolean).join('\n');
+
+        const screening = await screenResume({
+          resumeText,
+          jobTitle: r.job_title,
+          jobDescription: r.job_description,
+          requiredSkills: r.required_skills || [],
+        });
+
+        await pool.query(
+          `UPDATE job_applications
+           SET ai_score = $1, ai_summary = $2, ai_strengths = $3, ai_concerns = $4, ai_screened_at = NOW()
+           WHERE id = $5`,
+          [screening.score, screening.summary, screening.strengths, screening.concerns, application.id]
+        );
+        console.log(`[AI Auto-Screen] Application ${application.id}: score ${screening.score}`);
+      } catch (err) {
+        console.error('[AI Auto-Screen] error:', err.message);
+      }
+    });
+
+    res.json({
+      success: true,
       message: 'Application submitted successfully',
-      application: result.rows[0]
+      application,
     });
   } catch (error) {
     console.error('Error applying to job:', error);

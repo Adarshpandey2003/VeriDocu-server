@@ -21,7 +21,7 @@ export const protect = async (req, res, next) => {
 
       // Get user from database - include name from users table
       const result = await pool.query(
-        'SELECT id, email, account_type, is_verified, name, is_pro FROM users WHERE id = $1',
+        'SELECT id, email, account_type, is_verified, name, is_pro, plan_tier, plan_billing FROM users WHERE id = $1',
         [decoded.id]
       );
 
@@ -60,6 +60,10 @@ export const protect = async (req, res, next) => {
         is_verified: user.is_verified,
         isPro: !!user.is_pro,
         is_pro: !!user.is_pro,
+        planTier: user.plan_tier || 'free',
+        plan_tier: user.plan_tier || 'free',
+        planBilling: user.plan_billing || null,
+        plan_billing: user.plan_billing || null,
       };
       
       next();

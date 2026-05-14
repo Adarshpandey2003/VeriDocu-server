@@ -321,7 +321,7 @@ router.post('/otp/verify', async (req, res, next) => {
     // If register: create user and profile
     // Try to find the user by the original email or the normalized email used for OTP storage.
     const userResult = await pool.query(
-      'SELECT id, email, account_type FROM users WHERE email = $1 OR email = $2',
+      'SELECT id, email, account_type, is_pro, plan_tier FROM users WHERE email = $1 OR email = $2',
       [email, normEmail]
     );
     // (debug logging removed)
@@ -356,6 +356,7 @@ router.post('/otp/verify', async (req, res, next) => {
         email: user.email,
         accountType: user.account_type || accountType,
         isPro: !!user.is_pro,
+        planTier: user.plan_tier || 'free',
       },
     });
   } catch (error) {
@@ -546,6 +547,7 @@ router.post('/verify-email', async (req, res, next) => {
         accountType: user.account_type,
         name: user.name,
         isPro: !!user.is_pro,
+        planTier: user.plan_tier || 'free',
       },
     });
   } catch (error) {
@@ -585,7 +587,7 @@ router.post(
       if (!pwCol) return next(new AppError('Server misconfiguration: no password column found', 500));
 
       const result = await pool.query(
-        `SELECT id, email, ${pwCol} as password_value, account_type, name FROM users WHERE email = $1`,
+        `SELECT id, email, ${pwCol} as password_value, account_type, name, is_pro, plan_tier FROM users WHERE email = $1`,
         [email]
       );
 
@@ -675,6 +677,7 @@ router.post(
           accountType: user.account_type,
           role: user.account_type,
           isPro: !!user.is_pro,
+        planTier: user.plan_tier || 'free',
         },
       });
     } catch (error) {
@@ -723,7 +726,7 @@ router.post(
       if (!pwCol) return next(new AppError('Server misconfiguration: no password column found', 500));
 
       const userResult = await pool.query(
-        `SELECT id, email, account_type, name FROM users WHERE email = $1`,
+        `SELECT id, email, account_type, name, is_pro, plan_tier FROM users WHERE email = $1`,
         [email]
       );
 
@@ -735,7 +738,7 @@ router.post(
 
       // Get name - for candidates from candidates table, for companies from users table
       let displayName = user.name || email.split('@')[0];
-      
+
       if (user.account_type === 'candidate') {
         const candNameCol = await detectColumn('candidates', ['full_name', 'name', 'first_name']);
         if (candNameCol === 'full_name' || candNameCol === 'name') {
@@ -766,6 +769,7 @@ router.post(
           accountType: user.account_type,
           role: user.account_type,
           isPro: !!user.is_pro,
+          planTier: user.plan_tier || 'free',
         },
       });
     } catch (error) {
@@ -795,6 +799,49 @@ router.post('/logout', async (req, res, next) => {
   try {
     // Nothing to do server-side for stateless JWTs. Return success so clients don't error.
     res.json({ success: true, message: 'Logged out' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/auth/change-password
+// @desc    Change password for authenticated user
+// @access  Private
+router.post('/change-password', protect, [
+  body('currentPassword').notEmpty().withMessage('Current password is required'),
+  body('newPassword').isLength({ min: 8 }).withMessage('New password must be at least 8 characters'),
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { currentPassword, newPassword } = req.body;
+    const pwCol = await detectPasswordColumn();
+    if (!pwCol) return next(new AppError('Server misconfiguration', 500));
+
+    const result = await pool.query(
+      `SELECT ${pwCol} as password_value FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) return next(new AppError('User not found', 404));
+
+    if (!result.rows[0].password_value) {
+      return next(new AppError('Your account uses social login. Password change is not available.', 400));
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, result.rows[0].password_value);
+    if (!isMatch) {
+      return next(new AppError('Current password is incorrect', 401));
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashed = await bcrypt.hash(newPassword, salt);
+    await pool.query(`UPDATE users SET ${pwCol} = $1 WHERE id = $2`, [hashed, req.user.id]);
+
+    res.json({ success: true, message: 'Password changed successfully' });
   } catch (error) {
     next(error);
   }
@@ -1023,7 +1070,7 @@ router.post('/google/exchange',
 
       // Fetch fresh user data from database
       const userResult = await pool.query(
-        'SELECT id, email, account_type, name FROM users WHERE id = $1',
+        'SELECT id, email, account_type, name, is_pro, plan_tier FROM users WHERE id = $1',
         [authData.userId]
       );
 
@@ -1050,6 +1097,7 @@ router.post('/google/exchange',
           name: user.name,
           role: user.account_type,
           isPro: !!user.is_pro,
+        planTier: user.plan_tier || 'free',
         }
       });
     } catch (error) {
@@ -1158,6 +1206,7 @@ router.post('/google/complete-registration',
           name: newUser.name,
           role: newUser.account_type,
           isPro: !!newUser.is_pro,
+          planTier: newUser.plan_tier || 'free',
         }
       });
     } catch (error) {
@@ -1363,6 +1412,7 @@ router.post('/linkedin/complete-registration',
           name: newUser.name,
           role: newUser.account_type,
           isPro: !!newUser.is_pro,
+          planTier: newUser.plan_tier || 'free',
         }
       });
     } catch (error) {

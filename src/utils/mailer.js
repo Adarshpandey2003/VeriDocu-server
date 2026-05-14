@@ -154,4 +154,193 @@ Professional Verification Platform
   }
 }
 
-export default { sendOtpEmail };
+// ── Generic HTML email sender (reused by HR templates) ─────────────────
+async function sendBrandedEmail({ to, subject, heading, bodyHtml, ctaText, ctaUrl, footerNote, attachments }) {
+  const from = process.env.FROM_EMAIL || 'onboarding@resend.dev';
+
+  if (!RESEND_API_KEY || !resend) {
+    console.warn('⚠️  RESEND NOT CONFIGURED - Email will not be sent to', to);
+    console.warn(`   Subject: ${subject}`);
+    if (ctaUrl) console.warn(`   CTA URL: ${ctaUrl}`);
+    return { skipped: true };
+  }
+
+  const html = `
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"><title>${subject}</title>
+    <style>
+      body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;line-height:1.6;color:#333;margin:0;padding:0;background:#f4f4f4;}
+      .container{max-width:600px;margin:20px auto;background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.1);}
+      .header{background:linear-gradient(135deg,#2563eb 0%,#7c3aed 100%);padding:30px;text-align:center;color:white;}
+      .header h1{margin:0;font-size:26px;font-weight:600;}
+      .content{padding:36px 30px;}
+      .content h2{margin:0 0 16px 0;color:#1f2937;font-size:22px;}
+      .content p{font-size:15px;color:#4b5563;margin:12px 0;}
+      .cta-btn{display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#2563eb 0%,#7c3aed 100%);color:white !important;text-decoration:none;border-radius:8px;font-weight:600;margin:20px 0;}
+      .footer{background:#f8f9fa;padding:18px;text-align:center;font-size:13px;color:#6b7280;border-top:1px solid #e5e7eb;}
+      .footer-note{font-size:12px;color:#9ca3af;margin-top:8px;}
+    </style></head>
+    <body>
+      <div class="container">
+        <div class="header"><h1>VeriBoard</h1></div>
+        <div class="content">
+          <h2>${heading}</h2>
+          ${bodyHtml}
+          ${ctaText && ctaUrl ? `<div style="text-align:center;"><a href="${ctaUrl}" class="cta-btn">${ctaText}</a></div>` : ''}
+          ${footerNote ? `<p class="footer-note">${footerNote}</p>` : ''}
+        </div>
+        <div class="footer">
+          <p>© ${new Date().getFullYear()} VeriBoard · Professional Verification Platform</p>
+        </div>
+      </div>
+    </body></html>
+  `;
+
+  try {
+    const payload = {
+      from: `VeriBoard <${from}>`,
+      to: [to],
+      subject,
+      html,
+    };
+    if (attachments) payload.attachments = attachments;
+
+    const { data, error } = await resend.emails.send(payload);
+    if (error) {
+      console.error('[MAILER] Resend error:', error.message);
+      return { ok: false, error };
+    }
+    return { ok: true, messageId: data.id };
+  } catch (err) {
+    console.error('[MAILER] Exception:', err.message);
+    return { ok: false, error: err };
+  }
+}
+
+// ── Job collaborator invite ─────────────────────────────────────────────
+export async function sendCollaboratorInvite({ to, inviterName, companyName, jobTitle, role, magicLink }) {
+  const roleLabel = { co_owner: 'Co-Owner', recruiter: 'Recruiter', reviewer: 'Reviewer' }[role] || role;
+  return sendBrandedEmail({
+    to,
+    subject: `${inviterName} invited you to help hire on VeriBoard`,
+    heading: `You've been invited to collaborate`,
+    bodyHtml: `
+      <p><strong>${inviterName}</strong> from <strong>${companyName}</strong> has invited you to join the hiring team for:</p>
+      <p style="font-size:18px;font-weight:600;color:#111827;background:#f3f4f6;padding:14px;border-radius:8px;margin:16px 0;">${jobTitle}</p>
+      <p>Your role: <strong>${roleLabel}</strong></p>
+      <p>Click the button below to accept and start reviewing candidates.</p>
+    `,
+    ctaText: 'Accept Invitation',
+    ctaUrl: magicLink,
+    footerNote: 'This invitation link expires in 14 days.',
+  });
+}
+
+// ── Interview invite to candidate ───────────────────────────────────────
+export async function sendInterviewInvite({ to, candidateName, companyName, jobTitle, magicLink, slotCount }) {
+  return sendBrandedEmail({
+    to,
+    subject: `Interview invitation for ${jobTitle} at ${companyName}`,
+    heading: `You're invited to interview`,
+    bodyHtml: `
+      <p>Hi ${candidateName || 'there'},</p>
+      <p>Good news — <strong>${companyName}</strong> would like to interview you for the <strong>${jobTitle}</strong> role.</p>
+      <p>They've proposed ${slotCount || 'multiple'} time slot${slotCount === 1 ? '' : 's'}. Pick the one that works best for you using the button below.</p>
+    `,
+    ctaText: 'Choose a Time',
+    ctaUrl: magicLink,
+    footerNote: 'If you can\'t make any of these times, reply to the recruiter directly.',
+  });
+}
+
+// ── Interview confirmation (both parties) ──────────────────────────────
+export async function sendInterviewConfirmation({ to, recipientName, jobTitle, companyName, scheduledAt, mode, meetingLink, location, icsContent }) {
+  const dateStr = new Date(scheduledAt).toLocaleString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+  });
+  const modeLabel = { video: 'Video Call', phone: 'Phone Call', in_person: 'In-Person' }[mode] || mode;
+  const detailsLine = mode === 'video' && meetingLink
+    ? `<p>Meeting link: <a href="${meetingLink}">${meetingLink}</a></p>`
+    : mode === 'in_person' && location
+      ? `<p>Location: ${location}</p>`
+      : '';
+
+  const attachments = icsContent ? [{
+    filename: 'interview.ics',
+    content: Buffer.from(icsContent).toString('base64'),
+  }] : undefined;
+
+  return sendBrandedEmail({
+    to,
+    subject: `Interview confirmed: ${jobTitle} at ${companyName}`,
+    heading: `Your interview is confirmed`,
+    bodyHtml: `
+      <p>Hi ${recipientName || 'there'},</p>
+      <p>Your interview for <strong>${jobTitle}</strong> at <strong>${companyName}</strong> is confirmed.</p>
+      <p style="background:#f3f4f6;padding:14px;border-radius:8px;margin:16px 0;">
+        <strong>${dateStr}</strong><br>
+        Mode: ${modeLabel}
+      </p>
+      ${detailsLine}
+      <p>An ICS calendar attachment is included with this email.</p>
+    `,
+    attachments,
+  });
+}
+
+// ── Bulk onboarding invite (new candidate) ──────────────────────────────
+export async function sendBulkOnboardInvite({ to, candidateName, companyName, position, signupLink }) {
+  return sendBrandedEmail({
+    to,
+    subject: `${companyName} added you to VeriBoard as a verified employee`,
+    heading: `Welcome to VeriBoard`,
+    bodyHtml: `
+      <p>Hi ${candidateName || 'there'},</p>
+      <p><strong>${companyName}</strong> has added you to VeriBoard with a verified work-history record:</p>
+      <p style="font-size:16px;font-weight:600;color:#111827;background:#f3f4f6;padding:14px;border-radius:8px;margin:16px 0;">${position} · ${companyName}</p>
+      <p>Claim your account to:</p>
+      <ul style="color:#4b5563;font-size:15px;">
+        <li>Show your verified work history to future employers</li>
+        <li>Build a professional profile</li>
+        <li>Apply to jobs with a verified badge</li>
+      </ul>
+    `,
+    ctaText: 'Claim Your Account',
+    ctaUrl: signupLink,
+    footerNote: 'Your work history is already saved and verified by ' + companyName + '.',
+  });
+}
+
+// ── Application status update (rejection / shortlist) ──────────────────
+export async function sendApplicationStatusEmail({ to, candidateName, companyName, jobTitle, status, customMessage }) {
+  const messages = {
+    rejected: {
+      heading: 'Update on your application',
+      body: `<p>Hi ${candidateName || 'there'},</p>
+        <p>Thank you for your interest in the <strong>${jobTitle}</strong> role at <strong>${companyName}</strong>.</p>
+        <p>After careful consideration, we've decided to move forward with other candidates whose background more closely matches our current needs.</p>
+        <p>We genuinely appreciate the time you invested and wish you the best in your search.</p>`,
+    },
+    shortlisted: {
+      heading: 'Good news — you\'re shortlisted!',
+      body: `<p>Hi ${candidateName || 'there'},</p>
+        <p>Great news! Your application for <strong>${jobTitle}</strong> at <strong>${companyName}</strong> has been shortlisted.</p>
+        <p>The hiring team will be in touch shortly with next steps.</p>`,
+    },
+    reviewing: {
+      heading: 'Your application is being reviewed',
+      body: `<p>Hi ${candidateName || 'there'},</p>
+        <p>The team at <strong>${companyName}</strong> is now reviewing your application for <strong>${jobTitle}</strong>.</p>
+        <p>You'll hear from them soon.</p>`,
+    },
+  };
+  const template = messages[status] || { heading: 'Application update', body: `<p>Your application for ${jobTitle} has been updated.</p>` };
+  return sendBrandedEmail({
+    to,
+    subject: `${template.heading} — ${jobTitle}`,
+    heading: template.heading,
+    bodyHtml: template.body + (customMessage ? `<p><em>${customMessage}</em></p>` : ''),
+  });
+}
+
+export default { sendOtpEmail, sendCollaboratorInvite, sendInterviewInvite, sendInterviewConfirmation, sendBulkOnboardInvite, sendApplicationStatusEmail };
