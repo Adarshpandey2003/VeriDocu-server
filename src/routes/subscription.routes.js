@@ -196,7 +196,14 @@ router.post('/verify', protect, async (req, res, next) => {
       .update(`${razorpay_payment_id}|${razorpay_subscription_id}`)
       .digest('hex');
 
-    if (generated !== razorpay_signature) {
+    // Constant-time comparison to prevent timing-based signature recovery.
+    const sigOk = typeof razorpay_signature === 'string'
+      && razorpay_signature.length === generated.length
+      && crypto.timingSafeEqual(
+        Buffer.from(generated, 'hex'),
+        Buffer.from(razorpay_signature, 'hex')
+      );
+    if (!sigOk) {
       return res.status(400).json({ success: false, message: 'Payment verification failed.' });
     }
 
@@ -240,7 +247,13 @@ router.post('/webhook', async (req, res) => {
       .update(rawBody)
       .digest('hex');
 
-    if (expected !== signature) {
+    const sigOk = typeof signature === 'string'
+      && signature.length === expected.length
+      && crypto.timingSafeEqual(
+        Buffer.from(expected, 'hex'),
+        Buffer.from(signature, 'hex')
+      );
+    if (!sigOk) {
       console.error('[Webhook] Invalid signature');
       return res.status(400).json({ status: 'invalid_signature' });
     }

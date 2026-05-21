@@ -45,7 +45,8 @@ const feedSelectColumns = `
   CASE WHEN u.account_type = 'candidate' THEN c.avatar_url WHEN u.account_type = 'company' THEN co.logo_url ELSE NULL END AS author_avatar_path,
   CASE WHEN u.account_type = 'company' THEN co.slug ELSE NULL END AS author_company_slug,
   EXISTS (SELECT 1 FROM social_post_likes l WHERE l.post_id = p.id AND l.user_id = $1) AS liked_by_me,
-  EXISTS (SELECT 1 FROM social_bookmarks b WHERE b.post_id = p.id AND b.user_id = $1) AS bookmarked_by_me
+  EXISTS (SELECT 1 FROM social_bookmarks b WHERE b.post_id = p.id AND b.user_id = $1) AS bookmarked_by_me,
+  EXISTS (SELECT 1 FROM user_connections uc WHERE uc.follower_id = $1 AND uc.following_id = p.user_id) AS following_by_me
 `;
 
 const feedJoins = `

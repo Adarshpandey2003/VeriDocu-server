@@ -355,8 +355,8 @@ router.put('/profile', protect, async (req, res, next) => {
 
 // @route   GET /api/candidates/:id
 // @desc    Get candidate profile by ID (public profiles or authorized users)
-// @access  Public
-router.get('/:id', async (req, res, next) => {
+// @access  Private — login required; non-owners only see is_public profiles
+router.get('/:id', protect, async (req, res, next) => {
   try {
     // Check if user is authorized (authenticated and admin/owner)
     const isAuthorized = req.user && (req.user.role === 'admin' || req.user.id === req.params.id);
@@ -443,12 +443,28 @@ router.get('/:id', async (req, res, next) => {
 
     // Prefer candidate.full_name, fallback to username
     const row = result.rows[0];
+
+    // Check if the requesting user is following this candidate
+    let following_by_me = false;
+    if (req.user && req.user.id && req.user.id !== row.user_id) {
+      try {
+        const followResult = await pool.query(
+          'SELECT 1 FROM user_connections WHERE follower_id = $1 AND following_id = $2 LIMIT 1',
+          [req.user.id, row.user_id]
+        );
+        following_by_me = followResult.rows.length > 0;
+      } catch (err) {
+        console.warn('Failed to check follow status:', err.message);
+      }
+    }
+
     const profile = {
       ...row,
       name: row.full_name || row.username || null,
       experiences: experiencesWithLogos,
       educations: educationResult.rows,
-      hasVerifiedEmployment
+      hasVerifiedEmployment,
+      following_by_me
     };
 
     res.json({
@@ -709,14 +725,14 @@ router.get('/profile/cover-image-url', protect, async (req, res, next) => {
 
 // @route   GET /api/candidates/:id/avatar-url
 // @desc    Get candidate avatar signed URL by ID
-// @access  Public
-router.get('/:id/avatar-url', async (req, res, next) => {
+// @access  Private — non-owners only see is_public profiles
+router.get('/:id/avatar-url', protect, async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // First try to find by user_id
+    // First try to find by user_id (and check is_public)
     let result = await pool.query(
-      `SELECT c.avatar_url
+      `SELECT c.avatar_url, c.is_public, c.user_id
        FROM candidates c
        JOIN users u ON c.user_id = u.id
        WHERE u.id = $1`,
@@ -726,13 +742,20 @@ router.get('/:id/avatar-url', async (req, res, next) => {
     // If not found by user_id, try by candidate_id
     if (result.rows.length === 0) {
       result = await pool.query(
-        `SELECT avatar_url FROM candidates WHERE id = $1`,
+        `SELECT avatar_url, is_public, user_id FROM candidates WHERE id = $1`,
         [id]
       );
     }
 
     if (result.rows.length === 0 || !result.rows[0].avatar_url) {
       return next(new AppError('No avatar found', 404));
+    }
+
+    const row = result.rows[0];
+    const isOwner = req.user?.id === row.user_id;
+    const isAdmin = req.user?.role === 'admin';
+    if (!row.is_public && !isOwner && !isAdmin) {
+      return next(new AppError('Not authorized', 403));
     }
 
     const avatarPath = result.rows[0].avatar_url;
@@ -764,27 +787,34 @@ router.get('/:id/avatar-url', async (req, res, next) => {
 
 // @route   GET /api/candidates/:id/cover-image-url
 // @desc    Get candidate cover image signed URL by ID
-// @access  Public
-router.get('/:id/cover-image-url', async (req, res, next) => {
+// @access  Private — non-owners only see is_public profiles
+router.get('/:id/cover-image-url', protect, async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // First try to find by user_id
+    // First try to find by user_id (and check is_public)
     let result = await pool.query(
-      `SELECT c.cover_image_url FROM candidates c JOIN users u ON c.user_id = u.id WHERE u.id = $1`,
+      `SELECT c.cover_image_url, c.is_public, c.user_id FROM candidates c JOIN users u ON c.user_id = u.id WHERE u.id = $1`,
       [id]
     );
 
     // If not found by user_id, try by candidate_id
     if (result.rows.length === 0) {
       result = await pool.query(
-        `SELECT cover_image_url FROM candidates WHERE id = $1`,
+        `SELECT cover_image_url, is_public, user_id FROM candidates WHERE id = $1`,
         [id]
       );
     }
 
     if (result.rows.length === 0 || !result.rows[0].cover_image_url) {
       return next(new AppError('No cover image found', 404));
+    }
+
+    const row = result.rows[0];
+    const isOwner = req.user?.id === row.user_id;
+    const isAdmin = req.user?.role === 'admin';
+    if (!row.is_public && !isOwner && !isAdmin) {
+      return next(new AppError('Not authorized', 403));
     }
 
     const coverImagePath = result.rows[0].cover_image_url;

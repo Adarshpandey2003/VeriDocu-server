@@ -33,18 +33,36 @@ export const errorHandler = (err, req, res, next) => {
     });
   }
 
-  // PostgreSQL errors
+  // PostgreSQL errors — never leak internal detail/constraint/column names
+  // to the client; those enable schema enumeration.
   if (err.code === '23505') {
-    return res.status(409).json({
-      success: false,
-      message: 'Duplicate entry',
-      detail: err.detail,
-    });
+    const body = { success: false, message: 'Duplicate entry' };
+    if (process.env.NODE_ENV === 'development') body.detail = err.detail;
+    return res.status(409).json(body);
+  }
+  if (err.code === '23503') {
+    return res.status(409).json({ success: false, message: 'Related record not found' });
+  }
+  if (err.code === '23502') {
+    return res.status(400).json({ success: false, message: 'Required field missing' });
+  }
+  if (err.code === '23514') {
+    return res.status(400).json({ success: false, message: 'Invalid value' });
+  }
+
+  // Generic Postgres errors: hide internals in production.
+  if (typeof err.code === 'string' && /^[0-9A-Z]{5}$/.test(err.code) && process.env.NODE_ENV === 'production') {
+    return res.status(500).json({ success: false, message: 'Database error' });
   }
 
   // Default error
   const statusCode = err.statusCode || 500;
-  const message = err.message || 'Internal Server Error';
+  const isOperational = err.isOperational === true;
+  // In production, only expose operational error messages. Internal/unknown
+  // errors get a generic message so we don't leak implementation details.
+  const message = (process.env.NODE_ENV === 'production' && !isOperational)
+    ? 'Internal Server Error'
+    : (err.message || 'Internal Server Error');
 
   res.status(statusCode).json({
     success: false,

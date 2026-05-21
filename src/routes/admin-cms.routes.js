@@ -110,6 +110,87 @@ router.get('/posts', async (req, res) => {
   }
 });
 
+const VALID_CATEGORIES = ['latest-jobs', 'results', 'admit-card', 'answer-key', 'syllabus', 'admissions'];
+const VALID_STATUSES = ['draft', 'published'];
+
+// POST /api/admin/cms/posts/bulk-import — Bulk create CMS posts from a JSON array
+router.post('/posts/bulk-import', async (req, res) => {
+  try {
+    const { posts, defaultStatus = 'draft' } = req.body;
+
+    if (!Array.isArray(posts) || posts.length === 0) {
+      return res.status(400).json({ success: false, message: 'posts array is required' });
+    }
+    if (posts.length > 500) {
+      return res.status(400).json({ success: false, message: 'Maximum 500 posts per import' });
+    }
+
+    const results = { total: posts.length, succeeded: 0, failed: [], inserted: [] };
+
+    for (let i = 0; i < posts.length; i++) {
+      const raw = posts[i];
+      try {
+        const title = String(raw.title || '').trim();
+        const organization = String(raw.organization || raw.company || raw.employer || '').trim();
+        const category = VALID_CATEGORIES.includes(raw.category) ? raw.category : 'latest-jobs';
+
+        if (!title) {
+          results.failed.push({ index: i, title: title || '(missing)', reason: 'Missing title' });
+          continue;
+        }
+        if (!organization) {
+          results.failed.push({ index: i, title, reason: 'Missing organization' });
+          continue;
+        }
+
+        const status = VALID_STATUSES.includes(raw.status) ? raw.status : defaultStatus;
+        const isFeatured = !!raw.is_featured;
+        const slug = await uniqueSlug(generateSlug(title));
+        const publishedAt = status === 'published' ? new Date().toISOString() : null;
+
+        const insert = await pool.query(
+          `INSERT INTO cms_posts
+            (slug, title, organization, category, status, is_featured,
+             brief_info, important_dates, application_fee, age_limit,
+             vacancy_details, eligibility, how_to_apply, important_links,
+             advertisement_no, total_vacancies, meta_title, meta_description,
+             published_at, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+           RETURNING id, slug, title`,
+          [
+            slug, title, organization, category, status, isFeatured,
+            raw.brief_info || raw.description || null,
+            JSON.stringify(raw.important_dates || {}),
+            JSON.stringify(raw.application_fee || {}),
+            JSON.stringify(raw.age_limit || {}),
+            JSON.stringify(raw.vacancy_details || []),
+            raw.eligibility || null,
+            raw.how_to_apply || null,
+            JSON.stringify(raw.important_links || []),
+            raw.advertisement_no || null,
+            raw.total_vacancies ? parseInt(raw.total_vacancies, 10) || null : null,
+            raw.meta_title || null,
+            raw.meta_description || null,
+            publishedAt,
+            req.user.id,
+          ]
+        );
+
+        results.succeeded++;
+        results.inserted.push(insert.rows[0]);
+      } catch (rowErr) {
+        console.error(`[BulkImport] row ${i} error:`, rowErr.message);
+        results.failed.push({ index: i, title: raw.title || '(unknown)', reason: rowErr.message });
+      }
+    }
+
+    res.json({ success: true, ...results });
+  } catch (error) {
+    console.error('Error in bulk import:', error);
+    res.status(500).json({ success: false, message: 'Bulk import failed' });
+  }
+});
+
 // POST /api/admin/cms/posts — Create new post
 router.post('/posts', async (req, res) => {
   try {

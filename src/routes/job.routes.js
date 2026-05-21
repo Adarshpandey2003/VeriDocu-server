@@ -105,11 +105,16 @@ router.get('/', async (req, res) => {
         (SELECT COUNT(*) FROM job_applications WHERE job_id = j.id) as "applicationsCount"
     `;
 
-    // Add user-specific fields if authenticated
-    const userId = req.user?.id;
+    // hasApplied via EXISTS. userId comes from JWT-verified req.user.id and
+    // must be a UUID — validate before interpolating into SQL. We can't use
+    // a placeholder here because filter params are added below starting at
+    // $1 and the count query strips this SELECT clause.
+    const rawUserId = req.user?.id;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const userId = typeof rawUserId === 'string' && UUID_RE.test(rawUserId) ? rawUserId : null;
     if (userId) {
       query += `,
-        EXISTS(SELECT 1 FROM job_applications WHERE job_id = j.id AND user_id = ${userId}) as "hasApplied"
+        EXISTS(SELECT 1 FROM job_applications WHERE job_id = j.id AND user_id = '${userId}') as "hasApplied"
       `;
     } else {
       query += `, false as "hasApplied"`;

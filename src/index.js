@@ -38,6 +38,7 @@ import companyVerificationRoutes from './routes/company-verification.routes.js';
 import resumeRoutes from './routes/resume.routes.js';
 import cmsRoutes from './routes/cms.routes.js';
 import adminCmsRoutes from './routes/admin-cms.routes.js';
+import adminJobsRoutes from './routes/admin-jobs.routes.js';
 import feedRoutes from './routes/feed.routes.js';
 import subscriptionRoutes from './routes/subscription.routes.js';
 import collaboratorRoutes from './routes/collaborators.routes.js';
@@ -52,6 +53,12 @@ import { errorHandler } from './middleware/errorHandler.js';
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust the first proxy hop (Nginx). Required so req.ip reflects the real
+// client IP from X-Forwarded-For and express-rate-limit can key correctly.
+// Override with TRUST_PROXY env (number of proxies, or 'true'/'false').
+const trustProxy = process.env.TRUST_PROXY ?? '1';
+app.set('trust proxy', trustProxy === 'true' ? true : trustProxy === 'false' ? false : Number(trustProxy));
+
 // Simple console logger for serverless
 const logger = {
   info: (...args) => console.log('[INFO]', ...args),
@@ -61,23 +68,50 @@ const logger = {
 
 // Security middleware
 app.use(helmet());
+
+// CORS: parse comma-separated allowlist from CORS_ORIGIN. Fail closed in
+// production if unset; allow wildcard only in development for convenience.
+// A literal "*" entry means "allow any origin" — useful for local dev.
+const corsAllowlist = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const corsAllowAny = corsAllowlist.includes('*');
+const isProd = process.env.NODE_ENV === 'production';
+if (isProd && corsAllowlist.length === 0) {
+  console.error('[CORS] CORS_ORIGIN is not set in production — refusing to allow wildcard origins.');
+}
+if (isProd && corsAllowAny) {
+  console.warn('[CORS] CORS_ORIGIN contains "*" in production — every origin will be accepted.');
+}
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin: (origin, callback) => {
+    // Allow same-origin / curl / mobile (no Origin header)
+    if (!origin) return callback(null, true);
+    // Wildcard: explicit "*" in allowlist allows any origin
+    if (corsAllowAny) return callback(null, true);
+    // Dev convenience: wildcard if CORS_ORIGIN unset and not production
+    if (corsAllowlist.length === 0) {
+      return callback(null, !isProd);
+    }
+    return callback(null, corsAllowlist.includes(origin));
+  },
   credentials: true,
 }));
 
 // Rate limiting
 const generalLimiter = rateLimit({
   windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 min
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 500,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS', // don't count preflight
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 min
-  max: 20, // stricter for auth endpoints
+  windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: parseInt(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS) || 50,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many authentication attempts, please try again later.' },
@@ -86,15 +120,20 @@ const authLimiter = rateLimit({
 app.use('/api/', generalLimiter);
 app.use('/api/auth/otp', authLimiter);
 app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 app.use('/api/auth/verify-email', authLimiter);
 app.use('/api/auth/verify-login-otp', authLimiter);
 app.use('/api/auth/forgot-password', authLimiter);
+app.use('/api/auth/reset-password', authLimiter);
+app.use('/api/auth/change-password', authLimiter);
 
 // Raw body parser for Razorpay webhook (must be before express.json)
 app.use('/api/subscriptions/webhook', express.raw({ type: 'application/json' }));
 
 // Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
+// JSON body limit kept tight to defend against payload-based DoS. File
+// uploads use multer and have their own size guards.
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Initialize Passport
@@ -143,6 +182,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/admin/cms', adminCmsRoutes);
+app.use('/api/admin/jobs', adminJobsRoutes);
 app.use('/api/cms', cmsRoutes);
 app.use('/api/resume', resumeRoutes);
 app.use('/api/feed', feedRoutes);

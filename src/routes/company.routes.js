@@ -1,4 +1,5 @@
 import express from 'express';
+import jwt from 'jsonwebtoken';
 import { protect } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
@@ -267,6 +268,32 @@ router.get('/:slug', async (req, res, next) => {
 
     // Check if company is verified
     companyRow.isVerified = companyRow.verification_status === 'verified';
+
+    // Optional auth: decode token if present to populate following_by_me
+    let requesterId = null;
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+      try {
+        const token = req.headers.authorization.split(' ')[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        requesterId = decoded.id;
+      } catch (_) {
+        // Ignore — endpoint is public, follow status stays false
+      }
+    }
+
+    let following_by_me = false;
+    if (requesterId && companyRow.user_id && requesterId !== companyRow.user_id) {
+      try {
+        const followResult = await pool.query(
+          'SELECT 1 FROM user_connections WHERE follower_id = $1 AND following_id = $2 LIMIT 1',
+          [requesterId, companyRow.user_id]
+        );
+        following_by_me = followResult.rows.length > 0;
+      } catch (err) {
+        console.warn('Failed to check follow status:', err.message);
+      }
+    }
+    companyRow.following_by_me = following_by_me;
 
     res.json({
       success: true,

@@ -923,7 +923,7 @@ router.post('/forgot-password', [
 router.post('/reset-password', [
   body('email').isEmail().withMessage('Valid email is required'),
   body('code').notEmpty().withMessage('OTP code is required'),
-  body('newPassword').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+  body('newPassword').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
@@ -1217,6 +1217,21 @@ router.post('/google/complete-registration',
 
 // ===== LinkedIn OAuth Routes (OpenID Connect — no passport) =====
 
+// Short-lived store of valid OAuth state values to prevent CSRF on the callback.
+const linkedinStateStore = new Map();
+const STATE_TTL_MS = 10 * 60 * 1000;
+function storeLinkedinState(state) {
+  linkedinStateStore.set(state, Date.now() + STATE_TTL_MS);
+  setTimeout(() => linkedinStateStore.delete(state), STATE_TTL_MS);
+}
+function consumeLinkedinState(state) {
+  if (!state) return false;
+  const expiresAt = linkedinStateStore.get(state);
+  if (!expiresAt) return false;
+  linkedinStateStore.delete(state); // single-use
+  return expiresAt > Date.now();
+}
+
 router.get('/linkedin', (req, res) => {
   const clientId = process.env.LINKEDIN_CLIENT_ID;
   if (!clientId) {
@@ -1224,6 +1239,7 @@ router.get('/linkedin', (req, res) => {
   }
 
   const state = crypto.randomBytes(16).toString('hex');
+  storeLinkedinState(state);
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: clientId,
@@ -1239,9 +1255,15 @@ router.get('/linkedin/callback', async (req, res) => {
   const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
   try {
-    const { code, error } = req.query;
+    const { code, error, state } = req.query;
     if (error || !code) {
       return res.redirect(`${clientUrl}/auth/login?error=linkedin_auth_failed`);
+    }
+
+    // CSRF protection: state must match a value we issued in /linkedin
+    if (!consumeLinkedinState(state)) {
+      console.warn('[LinkedIn OAuth] Invalid or missing state — rejecting callback');
+      return res.redirect(`${clientUrl}/auth/login?error=linkedin_invalid_state`);
     }
 
     // Exchange code for access token
