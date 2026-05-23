@@ -45,6 +45,7 @@ import collaboratorRoutes from './routes/collaborators.routes.js';
 import bulkOnboardRoutes from './routes/bulk-onboard.routes.js';
 import interviewRoutes from './routes/interview.routes.js';
 import hrFeatureRoutes from './routes/hr-features.routes.js';
+import crawlerRoutes from './routes/crawler.routes.js';
 import pool from './config/database.js';
 
 // Import middleware
@@ -191,6 +192,7 @@ app.use('/api', collaboratorRoutes);
 app.use('/api/company', bulkOnboardRoutes);
 app.use('/api/interviews', interviewRoutes);
 app.use('/api', hrFeatureRoutes);
+app.use('/api/admin/crawler', crawlerRoutes);
 
 // Development-only debug routes removed
 
@@ -600,6 +602,76 @@ const runHrFeaturesMigration = async () => {
   }
 };
 
+const runCrawlerMigration = async () => {
+  try {
+    await pool.query('ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_external BOOLEAN DEFAULT FALSE');
+    await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_key TEXT');
+    await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS external_url TEXT');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source_key)');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crawler_sources (
+        id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        key             TEXT UNIQUE NOT NULL,
+        display_name    TEXT NOT NULL,
+        enabled         BOOLEAN NOT NULL DEFAULT FALSE,
+        schedule_cron   TEXT NOT NULL DEFAULT '0 2 * * *',
+        search_queries  TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        location_filter TEXT,
+        max_per_run     INT NOT NULL DEFAULT 50,
+        last_run_at     TIMESTAMPTZ,
+        last_status     TEXT,
+        last_error      TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS scraped_jobs (
+        id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        source_id        UUID NOT NULL REFERENCES crawler_sources(id) ON DELETE CASCADE,
+        external_id      TEXT NOT NULL,
+        external_url     TEXT,
+        ingested_job_id  UUID REFERENCES jobs(id) ON DELETE SET NULL,
+        raw_data         JSONB,
+        scraped_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(source_id, external_id)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_scraped_source_time ON scraped_jobs(source_id, scraped_at DESC)');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crawler_runs (
+        id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        source_id    UUID NOT NULL REFERENCES crawler_sources(id) ON DELETE CASCADE,
+        started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        finished_at  TIMESTAMPTZ,
+        status       TEXT NOT NULL DEFAULT 'running',
+        found_count  INT DEFAULT 0,
+        new_count    INT DEFAULT 0,
+        error_text   TEXT,
+        triggered_by TEXT NOT NULL DEFAULT 'cron'
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_crawler_runs_source ON crawler_runs(source_id, started_at DESC)');
+
+    await pool.query(`
+      INSERT INTO crawler_sources (key, display_name) VALUES
+        ('naukri',        'Naukri'),
+        ('foundit',       'Foundit (Monster India)'),
+        ('timesjobs',     'TimesJobs'),
+        ('shine',         'Shine'),
+        ('freshersworld', 'Freshersworld')
+      ON CONFLICT (key) DO NOTHING
+    `);
+
+    logger.info('Crawler migration applied');
+  } catch (err) {
+    logger.error('Crawler migration error:', err.message || err);
+  }
+};
+
 // Start server only if not in Vercel environment
 if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   app.listen(PORT, () => {
@@ -616,6 +688,12 @@ if (process.env.VERCEL !== '1' && !process.env.AWS_LAMBDA_FUNCTION_VERSION) {
   runFeedUpgradeMigration();
   runPlanMigration();
   runHrFeaturesMigration();
+  runCrawlerMigration().then(() => {
+    // Lazy-import so the scheduler is only loaded after migrations exist.
+    import('./crawlers/scheduler.js')
+      .then(({ start }) => start())
+      .catch((err) => logger.error('Crawler scheduler failed to start:', err.message || err));
+  });
 
   // Cleanup: delete notifications older than 7 days. Runs once at startup and then daily.
   const cleanupOldNotifications = async () => {

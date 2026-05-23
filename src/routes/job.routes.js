@@ -97,6 +97,8 @@ router.get('/', async (req, res) => {
         j.salary_max as "salaryMax",
         j.required_skills as "requiredSkills",
         j.benefits,
+        j.source_key as "sourceKey",
+        j.external_url as "externalUrl",
         j.created_at as "postedAt",
         c.name as company,
         c.logo_url as "companyLogo",
@@ -1349,6 +1351,8 @@ router.get('/:id', async (req, res) => {
         benefits: job.benefits || [],
         applicationForm: job.application_form || null,
         resumeRequired: job.resume_required || false,
+        sourceKey: job.source_key || null,
+        externalUrl: job.external_url || null,
         applicationsCount: parseInt(job.applicationsCount) || 0,
         viewsCount: parseInt(job.viewsCount) || 0
       }

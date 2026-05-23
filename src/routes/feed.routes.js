@@ -410,6 +410,94 @@ router.get('/suggested', async (req, res, next) => {
   }
 });
 
+// ─── GET /api/feed/recommended-jobs — interleaved job recs for feed ─
+
+router.get('/recommended-jobs', async (req, res, next) => {
+  try {
+    if (req.user.account_type !== 'candidate') {
+      return res.json({ success: true, jobs: [] });
+    }
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 6, 1), 20);
+
+    // Pull the candidate's signals. Missing rows or empty arrays are fine —
+    // the scoring expression below short-circuits with COALESCE so a brand-new
+    // candidate still gets the most-recent jobs ordered by recency.
+    const candRes = await pool.query(
+      `SELECT skills, title, location
+       FROM candidates
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    const cand = candRes.rows[0] || {};
+    const skills = Array.isArray(cand.skills) ? cand.skills.filter(Boolean) : [];
+    const candTitle = (cand.title || '').trim();
+    const candLocation = (cand.location || '').trim();
+
+    // Score breakdown:
+    //   +1 per overlapping skill (uses array intersection via unnest+ANY)
+    //   +3 if candidate's title appears in the job title (substring match)
+    //   +2 if candidate's location appears in the job's location
+    // Order by score DESC, then recency. Excludes jobs the candidate has
+    // already applied to.
+    // Pass empty-strings sentinel for missing signals so the CASE branches
+    // are always type-safe (`text <> ''` works for any text input). Skills
+    // come through as a `text[]` parameter and are used directly in ANY().
+    const result = await pool.query(
+      `SELECT
+         j.id,
+         j.title,
+         j.location,
+         j.employment_type      AS "employmentType",
+         j.salary_min           AS "salaryMin",
+         j.salary_max           AS "salaryMax",
+         j.required_skills      AS "requiredSkills",
+         j.source_key           AS "sourceKey",
+         j.external_url         AS "externalUrl",
+         j.created_at           AS "postedAt",
+         c.id                   AS "companyId",
+         c.name                 AS company,
+         c.logo_url             AS "companyLogo",
+         c.verification_status  AS "companyVerificationStatus",
+         (
+           SELECT COUNT(*)::int
+           FROM unnest(COALESCE(j.required_skills, ARRAY[]::TEXT[])) AS s
+           WHERE s = ANY($2::text[])
+         )
+         + CASE
+             WHEN $3::text <> '' AND j.title ILIKE '%' || $3::text || '%'
+             THEN 3 ELSE 0
+           END
+         + CASE
+             WHEN $4::text <> '' AND COALESCE(j.location, '') ILIKE '%' || $4::text || '%'
+             THEN 2 ELSE 0
+           END                  AS match_score
+       FROM jobs j
+       JOIN companies c ON c.id = j.company_id
+       WHERE j.is_active = TRUE
+         AND NOT EXISTS (
+           SELECT 1 FROM job_applications ja
+           WHERE ja.job_id = j.id AND ja.user_id = $1
+         )
+       ORDER BY match_score DESC, j.created_at DESC
+       LIMIT $5`,
+      [req.user.id, skills, candTitle, candLocation, limit]
+    );
+
+    const jobs = await Promise.all(
+      result.rows.map(async (j) => ({
+        ...j,
+        companyLogo: await signImageUrl(j.companyLogo),
+      }))
+    );
+
+    res.json({ success: true, jobs });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── GET /api/feed/profile-stats — follower/following counts ───────
 
 router.get('/profile-stats', async (req, res, next) => {
