@@ -1,17 +1,15 @@
-// Adapter registry. Adapters are imported lazily so missing optional deps
-// (e.g. Playwright) don't crash cheerio-only sources.
+// Adapter registry — now only holds legacy job-board references.
+// Company career crawling is handled by companyRunner.js which
+// dispatches based on company_careers.ats_type.
 
 const loaders = {
-  timesjobs:     () => import('./timesjobs.js'),
-  shine:         () => import('./shine.js'),
-  freshersworld: () => import('./freshersworld.js'),
-  foundit:       () => import('./foundit.js'),
-  naukri:        () => import('./naukri.js'),
+  // No active job-board crawlers. All jobs are sourced from company
+  // career pages via the companyRunner pipeline.
 };
 
 export async function loadAdapter(key) {
   const loader = loaders[key];
-  if (!loader) throw new Error(`Unknown crawler source: ${key}`);
+  if (!loader) throw new Error(`Unknown crawler source: ${key}. Job-board crawlers have been removed. Use company career crawling instead.`);
   const mod = await loader();
   const AdapterClass = mod.default;
   if (!AdapterClass) throw new Error(`Adapter ${key} has no default export`);

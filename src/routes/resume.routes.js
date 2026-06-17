@@ -14,7 +14,7 @@ import { callOpenAI } from '../services/aiService.js';
 const router = express.Router();
 
 const GENERATION_LIMITS = {
-  free:   { resume: 1,  coverLetter: 2 },
+  free:   { resume: 10, coverLetter: 2 },
   pro:    { resume: 5,  coverLetter: 5 },
   elite:  { resume: 30, coverLetter: 30 },
 };
@@ -185,6 +185,10 @@ REQUIRED PACKAGE BLOCK — use EXACTLY these lines, NO others, NO fontawesome, N
 
 FORBIDDEN PACKAGES (will cause compile errors): fontawesome, fontawesome5, fontspec, xunicode, xltxtra, lualatex packages, marvosym, pifont, wasysym, MnSymbol, any icon packages.
 
+FORBIDDEN COMMANDS (will cause compile errors because they are already defined by LaTeX):
+- Do NOT write \\newcommand{\\textbar} — \\textbar is already defined. Use it directly as \\textbar{}.
+- Do NOT redefine ANY standard LaTeX commands with \\newcommand or \\renewcommand.
+
 SECTION FORMATTING:
 \\titleformat{\\section}{\\large\\bfseries\\uppercase}{}{0em}{}[\\titlerule\\vspace{2pt}]
 \\titlespacing*{\\section}{0pt}{8pt}{4pt}
@@ -225,23 +229,29 @@ Generate the complete LaTeX resume now.`;
         latex = await callOpenAI({
           system: systemPrompt,
           user: userPrompt,
-          maxTokens: 4096,
+          maxTokens: 16000,
           temperature: 0.3,
         });
       } catch (err) {
-        console.error('OpenAI resume generation error:', err.message);
+        console.error('AI resume generation error:', err.message);
         return next(new AppError('AI generation failed. Please try again.', 502));
       }
 
-      // Strip any accidental markdown fences
-      latex = latex
-        .replace(/^```(?:latex|tex)?\s*/i, '')
-        .replace(/\s*```$/i, '')
-        .trim();
+      // Strip all markdown code fences (anywhere in the response, not just at edges)
+      latex = latex.replace(/```(?:latex|tex)?\s*/gi, '').replace(/```/g, '');
 
-      if (!latex.includes('\\documentclass')) {
+      // Remove any \newcommand{\textbar} or \renewcommand{\textbar} — \textbar is
+      // already defined by LaTeX's fontenc package; redefining it causes a fatal error.
+      latex = latex.replace(/\\(?:re)?newcommand\{\\textbar\}[^\n]*/g, '');
+
+      // Discard anything before \documentclass (explanatory text, think-block residue, etc.)
+      const docStart = latex.indexOf('\\documentclass');
+      if (docStart === -1) {
+        console.error('AI resume: no \\documentclass found. Raw output (first 500 chars):', latex.slice(0, 500));
         return next(new AppError('AI returned invalid LaTeX. Please try again.', 502));
       }
+      if (docStart > 0) latex = latex.slice(docStart);
+      latex = latex.trim();
 
       // Increment generation count
       await pool.query(
@@ -564,7 +574,7 @@ Write the cover letter now.`;
         coverLetter = await callOpenAI({
           system: systemPrompt,
           user: userPrompt,
-          maxTokens: 1024,
+          maxTokens: 4096,
           temperature: 0.5,
         });
       } catch (err) {

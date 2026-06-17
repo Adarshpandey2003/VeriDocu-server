@@ -66,6 +66,31 @@ export function cleanText(s) {
     .trim();
 }
 
+// Convert HTML to structured plain text, preserving bullets/paragraphs/headings as newlines.
+// Used by all ATS helpers so descriptions retain visual structure after tag removal.
+export function htmlToStructuredText(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<li[^>]*>/gi, '\n• ')
+    .replace(/<\/li>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<h[1-6][^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#?\w+;/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // Pulls a usable job description out of a detail-page HTML string.
 // Tries (in order): JSON-LD JobPosting, og:description, meta description,
 // common content selectors. Returns a string (may be empty).
@@ -87,7 +112,7 @@ export async function extractDescriptionFromHtml(html) {
         const type = node['@type'];
         const isJob = type === 'JobPosting' || (Array.isArray(type) && type.includes('JobPosting'));
         if (isJob && node.description) {
-          jsonLdDesc = cleanText(String(node.description).replace(/<[^>]+>/g, ' '));
+          jsonLdDesc = htmlToStructuredText(String(node.description));
           return;
         }
       }
@@ -122,7 +147,7 @@ export async function extractDescriptionFromHtml(html) {
   for (const sel of SELECTORS) {
     const node = $(sel).first();
     if (node.length) {
-      const t = cleanText(node.text());
+      const t = htmlToStructuredText(node.html() || '');
       if (t.length > bodyDesc.length) bodyDesc = t;
       if (bodyDesc.length > 400) break;
     }
@@ -192,4 +217,18 @@ export function guessFaviconUrl(companyName) {
   const domain = name.replace(/[^a-z0-9]+/g, '');
   if (!domain) return '';
   return `https://www.google.com/s2/favicons?domain=${domain}.com&sz=64`;
+}
+
+// Pre-compiled regex for Indian location matching.
+// Matches major Indian cities, states, and country indicators.
+const INDIA_RE = /\b(?:india|bharat|IN\b|IND\b|bangalore|bengaluru|bengal|mumbai|bombay|delhi|new delhi|ncr|noida|gurgaon|gurugram|hyderabad|secunderabad|pune|pimpri|chennai|madras|kolkata|calcutta|ahmedabad|gandhinagar|chandigarh|jaipur|kochi|cochin|trivandrum|thiruvananthapuram|coimbatore|madurai|indore|lucknow|kanpur|nagpur|bhopal|patna|visakhapatnam|vizag|vadodara|baroda|surat|rajkot|bhubaneswar|guwahati|mysore|mangalore|goa|panaji|pondicherry|puducherry|dehradun|shimla|jammu|srinagar|raipur|ranchi|jamshedpur|dhanbad|karnataka|maharashtra|tamil nadu|telangana|andhra pradesh|uttar pradesh|UP\b|west bengal|gujarat|kerala|haryana|punjab|rajasthan|bihar|odisha|orissa|assam|madhya pradesh|chhattisgarh|jharkhand|uttarakhand|himachal pradesh|manipur|meghalaya|mizoram|nagaland|sikkim|tripura|arunachal)\b/i;
+
+/**
+ * Returns true if the location string likely refers to an Indian location.
+ * Used by crawlers to filter out non-India jobs at source.
+ */
+export function isIndianLocation(locationText) {
+  if (!locationText) return false; // null = unknown, don't filter out
+  const s = String(locationText).replace(/\s+/g, ' ');
+  return INDIA_RE.test(s);
 }

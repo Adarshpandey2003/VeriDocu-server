@@ -1,12 +1,12 @@
-// Shared AI service — single point of integration with OpenAI.
+// Shared AI service — OpenAI-compatible interface (currently backed by DeepSeek).
 // Used by resume generation, cover letter generation, AI screening, interview questions.
 
-const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
-const DEFAULT_MODEL = 'gpt-4o-mini';
+const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions';
+const DEFAULT_MODEL = 'deepseek-v4-pro';
 
 export async function callOpenAI({ system, user, model = DEFAULT_MODEL, maxTokens = 2048, temperature = 0.3, json = false, timeoutMs = 60000 }) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY not configured');
+  if (!process.env.DEEPSEEK_API_KEY) {
+    throw new Error('DEEPSEEK_API_KEY not configured');
   }
 
   const controller = new AbortController();
@@ -24,10 +24,10 @@ export async function callOpenAI({ system, user, model = DEFAULT_MODEL, maxToken
     };
     if (json) body.response_format = { type: 'json_object' };
 
-    const res = await fetch(OPENAI_URL, {
+    const res = await fetch(DEEPSEEK_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -36,7 +36,7 @@ export async function callOpenAI({ system, user, model = DEFAULT_MODEL, maxToken
 
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
-      const err = new Error(errBody?.error?.message || `OpenAI request failed: ${res.status}`);
+      const err = new Error(errBody?.error?.message || `DeepSeek request failed: ${res.status}`);
       err.statusCode = res.status;
       err.openaiError = errBody;
       throw err;
@@ -100,7 +100,7 @@ Provide 2-4 strengths and 1-3 concerns. Keep bullets to <12 words each.`;
   const result = await callOpenAIJson({
     system,
     user,
-    maxTokens: 800,
+    maxTokens: 4096,
     temperature: 0.2,
   });
 
@@ -141,7 +141,7 @@ Guidelines:
   const result = await callOpenAIJson({
     system,
     user,
-    maxTokens: 1200,
+    maxTokens: 4096,
     temperature: 0.5,
   });
 
