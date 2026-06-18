@@ -15,8 +15,8 @@ const router = express.Router();
 
 const GENERATION_LIMITS = {
   free:   { resume: 10, coverLetter: 2 },
-  pro:    { resume: 5,  coverLetter: 5 },
-  elite:  { resume: 30, coverLetter: 30 },
+  pro:    { resume: 300, coverLetter: 300 },
+  elite:  { resume: Infinity, coverLetter: Infinity },
 };
 
 async function checkAndResetMonthly(userId) {
@@ -439,8 +439,8 @@ router.get('/generation-status', protect, async (req, res, next) => {
       planTier: tier,
       resumeCount: u.resume_generation_count || 0,
       coverLetterCount: u.cover_letter_generation_count || 0,
-      resumeLimit: limits.resume,
-      coverLetterLimit: limits.coverLetter,
+      resumeLimit: Number.isFinite(limits.resume) ? limits.resume : null,
+      coverLetterLimit: Number.isFinite(limits.coverLetter) ? limits.coverLetter : null,
     });
   } catch (err) {
     next(err);

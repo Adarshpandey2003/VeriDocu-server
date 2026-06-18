@@ -350,20 +350,20 @@ router.get('/plans', async (req, res) => {
         free: {
           name: 'Starter', price: 0, features: [
             'Apply to verified jobs', 'Basic profile visibility', 'Limited job recommendations',
-            '1 resume generation/month', '2 cover letters/month',
+            '10 resume generations/month', '2 cover letters/month',
           ],
         },
         pro: {
           name: 'Pro', monthly: 299, yearly: 2499, features: [
             'Top priority in job recommendations', 'Highly relevant job matching',
-            '5 resume generations/month', '5 cover letters/month',
+            '300 resume generations/month', '300 cover letters/month',
             'Priority visibility to recruiters', 'Basic profile insights',
           ],
         },
         elite: {
           name: 'Elite', monthly: 699, yearly: 5999, features: [
             'All Pro features', 'See who viewed your profile',
-            '30 resume generations/month', '30 cover letters/month',
+            'Unlimited resume generations', 'Unlimited cover letters',
             'AI resume & profile optimization', 'Instant alerts for high-match jobs',
             '"Verified Pro Candidate" badge',
           ],
