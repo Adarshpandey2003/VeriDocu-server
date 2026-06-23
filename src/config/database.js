@@ -10,25 +10,13 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false // Required for Supabase
   },
-  max: 10, // Reduced for Supabase Session Pooler
-  min: 2, // Keep minimum connections alive
-  idleTimeoutMillis: 10000, // Shorter idle timeout for Supabase (10 seconds)
+  max: 10,
+  min: 0, // Don't keep idle connections — Supabase kills them and causes ETIMEDOUT noise
+  idleTimeoutMillis: 30000, // Remove idle clients from pool before Supabase kills them (~60s)
   connectionTimeoutMillis: 10000,
-  allowExitOnIdle: false, // Keep pool alive
-  // Supabase-specific settings
-  keepAlive: true, // Send TCP keepalive packets
+  allowExitOnIdle: false,
+  keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
-});
-
-// Test connection (only log in development)
-pool.on('connect', (client) => {
-  if (process.env.NODE_ENV === 'development') {
-    console.log('✓ Connected to PostgreSQL database');
-  }
-  // Set statement timeout to prevent long-running queries
-  client.query('SET statement_timeout = 30000').catch(err => {
-    console.error('Error setting statement timeout:', err);
-  });
 });
 
 pool.on('error', (err, client) => {
