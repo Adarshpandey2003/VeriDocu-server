@@ -191,6 +191,54 @@ router.post('/posts/bulk-import', async (req, res) => {
   }
 });
 
+// PATCH /api/admin/cms/posts/bulk-status — Set status for multiple posts at once
+router.patch('/posts/bulk-status', async (req, res) => {
+  try {
+    const { ids, status } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'ids array is required' });
+    }
+    if (!VALID_STATUSES.includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid status' });
+    }
+
+    const result = await pool.query(
+      `UPDATE cms_posts
+       SET status = $2,
+           published_at = CASE WHEN $2 = 'published' AND status <> 'published' THEN now() ELSE published_at END,
+           updated_at = now()
+       WHERE id = ANY($1::uuid[])
+       RETURNING id`,
+      [ids, status]
+    );
+
+    res.json({ success: true, updated: result.rows.length });
+  } catch (error) {
+    console.error('Error in bulk status update:', error);
+    res.status(500).json({ success: false, message: 'Bulk status update failed' });
+  }
+});
+
+// POST /api/admin/cms/posts/bulk-delete — Delete multiple posts at once
+router.post('/posts/bulk-delete', async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'ids array is required' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM cms_posts WHERE id = ANY($1::uuid[]) RETURNING id`,
+      [ids]
+    );
+
+    res.json({ success: true, deleted: result.rows.length });
+  } catch (error) {
+    console.error('Error in bulk delete:', error);
+    res.status(500).json({ success: false, message: 'Bulk delete failed' });
+  }
+});
+
 // POST /api/admin/cms/posts — Create new post
 router.post('/posts', async (req, res) => {
   try {
