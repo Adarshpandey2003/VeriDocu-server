@@ -75,6 +75,42 @@ export const protect = async (req, res, next) => {
   }
 };
 
+// Like `protect`, but never rejects: if a valid Bearer token is present it sets
+// req.user (id + accountType only, cheap — no name lookup); otherwise it silently
+// continues. Use on public routes that personalize output when a user is logged in.
+export const optionalAuth = async (req, res, next) => {
+  try {
+    let token;
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+      token = req.headers.authorization.split(' ')[1];
+    }
+    if (!token) return next();
+
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const result = await pool.query(
+        'SELECT id, email, account_type FROM users WHERE id = $1',
+        [decoded.id]
+      );
+      if (result.rows.length > 0) {
+        const user = result.rows[0];
+        req.user = {
+          id: user.id,
+          email: user.email,
+          accountType: user.account_type,
+          account_type: user.account_type,
+          role: user.account_type,
+        };
+      }
+    } catch (_) {
+      // Invalid/expired token → treat as anonymous, don't block the request.
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const authorize = (...accountTypes) => {
   return (req, res, next) => {
     // Check if user exists (protect middleware should have set this)

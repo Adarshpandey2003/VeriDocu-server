@@ -1,5 +1,5 @@
 import express from 'express';
-import { protect } from '../middleware/auth.js';
+import { protect, optionalAuth } from '../middleware/auth.js';
 import pool from '../config/database.js';
 import { deleteFromBucket, BUCKET_NAME, createSignedUrl, signImageUrl } from '../utils/supabaseStorage.js';
 import { AppError } from '../middleware/errorHandler.js';
@@ -69,7 +69,7 @@ router.get('/suggestions', async (req, res) => {
 // @route   GET /api/jobs
 // @desc    Browse all active jobs with filters
 // @access  Public
-router.get('/', async (req, res) => {
+router.get('/', optionalAuth, async (req, res) => {
   try {
     const {
       search,
@@ -79,7 +79,7 @@ router.get('/', async (req, res) => {
       employmentType,
       companyId,
       topCompaniesOnly,
-      sortBy = 'recent', // recent, salary-high, salary-low, company
+      sortBy = 'recommended', // recommended, recent, salary-high, salary-low, company, applications
       page: pageRaw,
       limit: limitRaw,
     } = req.query;
@@ -184,22 +184,68 @@ router.get('/', async (req, res) => {
     }
 
     // Sorting
-    switch (sortBy) {
-      case 'salary-high':
-        query += ` ORDER BY j.salary_max DESC NULLS LAST, j.created_at DESC`;
-        break;
-      case 'salary-low':
-        query += ` ORDER BY j.salary_min ASC NULLS LAST, j.created_at DESC`;
-        break;
-      case 'company':
-        query += ` ORDER BY c.name ASC, j.created_at DESC`;
-        break;
-      case 'applications':
-        query += ` ORDER BY "applicationsCount" DESC, j.created_at DESC`;
-        break;
-      case 'recent':
-      default:
-        query += ` ORDER BY j.created_at DESC`;
+    let scoreParams = [];
+    if (sortBy === 'recommended') {
+      // Personalized relevance + company de-clustering. A window ROW_NUMBER per
+      // company interleaves results round-robin (best job from each company first,
+      // then the 2nd from each, …) so a single company can't dominate the page.
+      // Within each round, higher relevance wins, then recency.
+      // Guests/companies still get the round-robin + verified boost + recency; only
+      // candidates get the skill/title/location personalization.
+      let skills = [];
+      let title = '';
+      let loc = '';
+      if (req.user?.accountType === 'candidate') {
+        try {
+          const cand = await pool.query(
+            `SELECT COALESCE(skills, ARRAY[]::text[]) AS skills,
+                    COALESCE(NULLIF(professional_title, ''), title, '') AS title,
+                    COALESCE(location, '') AS location
+             FROM candidates WHERE user_id = $1`,
+            [req.user.id]
+          );
+          if (cand.rows[0]) {
+            skills = Array.isArray(cand.rows[0].skills) ? cand.rows[0].skills : [];
+            title = cand.rows[0].title || '';
+            loc = cand.rows[0].location || '';
+          }
+        } catch (_) { /* fall back to non-personalized ordering */ }
+      }
+
+      const pSkills = paramIndex;
+      const pTitle = paramIndex + 1;
+      const pLoc = paramIndex + 2;
+      scoreParams = [skills, title, loc];
+      paramIndex += 3;
+
+      // Score params are referenced ONLY in ORDER BY (stripped by the count query),
+      // so they are pushed to `params` after the count query runs — see below.
+      const scoreExpr = `(
+        (SELECT COUNT(*) FROM unnest(COALESCE(j.required_skills, ARRAY[]::text[])) sk WHERE sk = ANY($${pSkills}::text[])) * 2
+        + CASE WHEN $${pTitle} <> '' AND j.title ILIKE '%' || $${pTitle} || '%' THEN 3 ELSE 0 END
+        + CASE WHEN $${pLoc} <> '' AND COALESCE(j.location, '') ILIKE '%' || $${pLoc} || '%' THEN 2 ELSE 0 END
+        + CASE WHEN c.verification_status = 'verified' THEN 1 ELSE 0 END
+      )`;
+
+      query += ` ORDER BY ROW_NUMBER() OVER (PARTITION BY j.company_id ORDER BY ${scoreExpr} DESC, j.created_at DESC) ASC, ${scoreExpr} DESC, j.created_at DESC`;
+    } else {
+      switch (sortBy) {
+        case 'salary-high':
+          query += ` ORDER BY j.salary_max DESC NULLS LAST, j.created_at DESC`;
+          break;
+        case 'salary-low':
+          query += ` ORDER BY j.salary_min ASC NULLS LAST, j.created_at DESC`;
+          break;
+        case 'company':
+          query += ` ORDER BY c.name ASC, j.created_at DESC`;
+          break;
+        case 'applications':
+          query += ` ORDER BY "applicationsCount" DESC, j.created_at DESC`;
+          break;
+        case 'recent':
+        default:
+          query += ` ORDER BY j.created_at DESC`;
+      }
     }
 
     // Pagination
@@ -213,6 +259,11 @@ router.get('/', async (req, res) => {
     }`;
     const countResult = await pool.query(countQuery, params);
     const total = countResult.rows[0]?.total || 0;
+
+    // Scoring params (recommended sort) are referenced only in ORDER BY, which the
+    // count query strips — push them now, after the count query has run, so their
+    // $N positions land immediately after the filter params.
+    if (scoreParams.length) params.push(...scoreParams);
 
     params.push(limit);
     query += ` LIMIT $${params.length}`;
