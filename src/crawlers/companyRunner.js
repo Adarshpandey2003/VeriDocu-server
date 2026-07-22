@@ -251,6 +251,26 @@ async function dispatchAdapter(atsType, boardKey, careerUrl, maxJobs, ctx, compa
       return raw.map(normalizeJob).slice(0, maxJobs);
     }
 
+    case 'keka': {
+      const { fetchKekaJobs, normalizeJob, isIndianJob } = await import('./helpers/keka.js');
+      const raw = await fetchKekaJobs(boardKey);
+      return raw
+        .filter(isIndianJob)
+        .map((j) => normalizeJob(j, boardKey))
+        .slice(0, maxJobs);
+    }
+
+    case 'custom-json': {
+      const cfg = companyCareersRow?.selectors || {};
+      if (!cfg.apiUrl) {
+        ctx.log('custom-json source has no selectors.apiUrl configured — skipping');
+        return [];
+      }
+      const { fetchCustomJson, normalizeJob } = await import('./helpers/customJson.js');
+      const raw = await fetchCustomJson(cfg);
+      return raw.map((j) => normalizeJob(j, cfg, careerUrl)).slice(0, maxJobs);
+    }
+
     case 'workday': {
       const { fetchWorkdayJobs, fetchWorkdayJobDetail, normalizeJob } = await import('./helpers/workday.js');
       // board_key format: "domain" (assumes External site) or "domain|site"

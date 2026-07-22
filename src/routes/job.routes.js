@@ -163,9 +163,9 @@ router.get('/', optionalAuth, async (req, res) => {
       paramIndex++;
     }
 
-    // Employment type filter
+    // Employment type filter (stored values vary in case, e.g. 'Full-time')
     if (employmentType && employmentType !== 'all') {
-      query += ` AND j.employment_type = $${paramIndex}`;
+      query += ` AND LOWER(j.employment_type) = LOWER($${paramIndex})`;
       params.push(employmentType);
       paramIndex++;
     }
@@ -186,48 +186,103 @@ router.get('/', optionalAuth, async (req, res) => {
     // Sorting
     let scoreParams = [];
     if (sortBy === 'recommended') {
-      // Personalized relevance + company de-clustering. A window ROW_NUMBER per
-      // company interleaves results round-robin (best job from each company first,
-      // then the 2nd from each, …) so a single company can't dominate the page.
-      // Within each round, higher relevance wins, then recency.
-      // Guests/companies still get the round-robin + verified boost + recency; only
-      // candidates get the skill/title/location personalization.
+      // Personalized relevance for candidates, built from their profile:
+      //  - full-text rank of skills + role terms against j.search_vector
+      //    (title/location/description — works for scraped jobs, which mostly
+      //    have no required_skills array)
+      //  - role tokens (professional title + recent positions) matched against
+      //    the job title — the strongest signal
+      //  - case-insensitive skill hits in required_skills when present
+      //  - location / verified-company / freshness boosts
+      //  - already-applied jobs sink to the bottom
+      // A per-company rank penalty (instead of strict round-robin) keeps one
+      // company from flooding the page without burying relevant clusters.
+      // Guests/companies get only the non-personalized boosts.
       let skills = [];
-      let title = '';
+      let roleTerms = [];
       let loc = '';
       if (req.user?.accountType === 'candidate') {
         try {
           const cand = await pool.query(
-            `SELECT COALESCE(skills, ARRAY[]::text[]) AS skills,
-                    COALESCE(NULLIF(professional_title, ''), title, '') AS title,
-                    COALESCE(location, '') AS location
-             FROM candidates WHERE user_id = $1`,
+            `SELECT COALESCE(c.skills, ARRAY[]::text[]) AS skills,
+                    COALESCE(NULLIF(c.professional_title, ''), c.title, '') AS title,
+                    COALESCE(c.location, '') AS location,
+                    COALESCE((
+                      SELECT array_agg(p.position) FROM (
+                        SELECT position FROM employment_history
+                        WHERE candidate_id = c.id AND position IS NOT NULL
+                        ORDER BY COALESCE(end_date, CURRENT_DATE) DESC
+                        LIMIT 3
+                      ) p
+                    ), ARRAY[]::text[]) AS positions
+             FROM candidates c WHERE c.user_id = $1`,
             [req.user.id]
           );
-          if (cand.rows[0]) {
-            skills = Array.isArray(cand.rows[0].skills) ? cand.rows[0].skills : [];
-            title = cand.rows[0].title || '';
-            loc = cand.rows[0].location || '';
+          const row = cand.rows[0];
+          if (row) {
+            skills = (Array.isArray(row.skills) ? row.skills : [])
+              .map((s) => String(s).toLowerCase().trim())
+              .filter(Boolean)
+              .slice(0, 15);
+            loc = (row.location || '').split(',')[0].trim();
+            // Seniority/filler words would match nearly every job title, so
+            // only role-describing tokens survive.
+            const STOP = new Set([
+              'the', 'and', 'for', 'with', 'senior', 'junior', 'lead', 'staff',
+              'principal', 'associate', 'assistant', 'head', 'chief', 'intern',
+              'trainee', 'fresher', 'level', 'iii', 'executive', 'working', 'student',
+            ]);
+            roleTerms = [...new Set(
+              [row.title, ...row.positions]
+                .join(' ')
+                .toLowerCase()
+                .split(/[^a-z0-9+#.]+/)
+                .filter((t) => t.length >= 3 && !STOP.has(t))
+            )].slice(0, 8);
           }
         } catch (_) { /* fall back to non-personalized ordering */ }
       }
 
-      const pSkills = paramIndex;
-      const pTitle = paramIndex + 1;
-      const pLoc = paramIndex + 2;
-      scoreParams = [skills, title, loc];
-      paramIndex += 3;
+      const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      // Word-boundary match that also works for terms ending in non-word
+      // chars ("c++", "c#"), which \m...\M can't handle.
+      const wordPattern = (t) => `(^|[^a-zA-Z0-9])${escapeRegex(t)}([^a-zA-Z0-9]|$)`;
+      // websearch_to_tsquery understands OR + quoted phrases and never throws
+      // on user input; multi-word skills become phrase matches.
+      const tsQueryText = [...new Set([...skills, ...roleTerms])]
+        .map((t) => (/\s/.test(t) ? `"${t.replace(/"/g, ' ')}"` : t.replace(/"/g, '')))
+        .join(' OR ');
+
+      const pTsq = paramIndex;
+      const pRole = paramIndex + 1;
+      const pSkills = paramIndex + 2;
+      const pLoc = paramIndex + 3;
+      scoreParams = [tsQueryText, roleTerms.map(wordPattern), skills, loc];
+      paramIndex += 4;
+
+      const appliedPenalty = userId
+        ? `- CASE WHEN EXISTS(SELECT 1 FROM job_applications WHERE job_id = j.id AND user_id = '${userId}') THEN 50 ELSE 0 END`
+        : '';
 
       // Score params are referenced ONLY in ORDER BY (stripped by the count query),
       // so they are pushed to `params` after the count query runs — see below.
       const scoreExpr = `(
-        (SELECT COUNT(*) FROM unnest(COALESCE(j.required_skills, ARRAY[]::text[])) sk WHERE sk = ANY($${pSkills}::text[])) * 2
-        + CASE WHEN $${pTitle} <> '' AND j.title ILIKE '%' || $${pTitle} || '%' THEN 3 ELSE 0 END
-        + CASE WHEN $${pLoc} <> '' AND COALESCE(j.location, '') ILIKE '%' || $${pLoc} || '%' THEN 2 ELSE 0 END
+        CASE WHEN $${pTsq} = '' THEN 0
+             ELSE ts_rank_cd(j.search_vector, websearch_to_tsquery('english', $${pTsq})) * 10 END
+        + LEAST((SELECT COUNT(*) FROM unnest($${pRole}::text[]) t WHERE j.title ~* t), 3) * 3
+        + LEAST((SELECT COUNT(*) FROM unnest(COALESCE(j.required_skills, ARRAY[]::text[])) rs
+                 WHERE lower(rs) = ANY($${pSkills}::text[])), 4) * 2
+        + CASE WHEN $${pLoc} <> '' AND j.location ILIKE '%' || $${pLoc} || '%' THEN 2.5
+               WHEN COALESCE(j.location, '') ~* '(remote|work from home|anywhere)' THEN 1 ELSE 0 END
         + CASE WHEN c.verification_status = 'verified' THEN 1 ELSE 0 END
+        + CASE WHEN j.created_at > now() - interval '7 days' THEN 1.5
+               WHEN j.created_at > now() - interval '30 days' THEN 0.75 ELSE 0 END
+        ${appliedPenalty}
       )`;
 
-      query += ` ORDER BY ROW_NUMBER() OVER (PARTITION BY j.company_id ORDER BY ${scoreExpr} DESC, j.created_at DESC) ASC, ${scoreExpr} DESC, j.created_at DESC`;
+      query += ` ORDER BY (${scoreExpr}
+        - LEAST(ROW_NUMBER() OVER (PARTITION BY j.company_id ORDER BY ${scoreExpr} DESC, j.created_at DESC) - 1, 8) * 0.75
+      ) DESC, j.created_at DESC, j.id`;
     } else {
       switch (sortBy) {
         case 'salary-high':
@@ -724,112 +779,6 @@ router.delete('/:id', protect, async (req, res) => {
   } catch (error) {
     console.error('Error deleting job:', error);
     res.status(500).json({ success: false, message: 'Error deleting job posting' });
-  }
-});
-
-// Get all jobs
-router.get('/', async (req, res) => {
-  try {
-    const { search, location, type } = req.query;
-    const userId = req.user?.id; // Get user ID if authenticated
-    
-    const params = [];
-    let paramIndex = 0;
-    
-    let query = `
-      SELECT 
-        j.*,
-        c.name as company,
-        c.logo_url as "companyLogo",
-        c.verification_status as "companyVerificationStatus",
-        c.slug,
-        COALESCE(app_count.count, 0) as "applicationsCount",
-        COALESCE(view_count.count, 0) as "viewsCount"
-    `;
-    
-    // Add hasApplied check if user is authenticated
-    if (userId) {
-      params.push(userId);
-      paramIndex++;
-      query += `, EXISTS(SELECT 1 FROM job_applications WHERE job_id = j.id AND user_id = $${paramIndex}) as "hasApplied"`;
-    } else {
-      query += `, false as "hasApplied"`;
-    }
-    
-    query += `
-      FROM jobs j
-      JOIN companies c ON j.company_id = c.id
-      LEFT JOIN (
-        SELECT job_id, COUNT(*) as count
-        FROM job_applications
-        GROUP BY job_id
-      ) app_count ON j.id = app_count.job_id
-      LEFT JOIN (
-        SELECT job_id, COUNT(*) as count
-        FROM job_views
-        GROUP BY job_id
-      ) view_count ON j.id = view_count.job_id
-      WHERE j.is_active = true
-    `;
-    
-    if (search && search.trim()) {
-      // Full-text search across title, description, and company name
-      params.push(`%${search.trim()}%`);
-      paramIndex++;
-      query += ` AND (
-        j.title ILIKE $${paramIndex} OR 
-        j.description ILIKE $${paramIndex} OR 
-        c.name ILIKE $${paramIndex} OR
-        j.location ILIKE $${paramIndex}
-      )`;
-    }
-    
-    if (location && location.trim()) {
-      params.push(`%${location.trim()}%`);
-      paramIndex++;
-      query += ` AND j.location ILIKE $${paramIndex}`;
-    }
-    
-    if (type && type.trim()) {
-      params.push(type.trim());
-      paramIndex++;
-      query += ` AND j.employment_type = $${paramIndex}`;
-    }
-    
-    query += ` ORDER BY j.created_at DESC`;
-    
-    const result = await pool.query(query, params);
-    
-    // convert company logos to signed urls for single-job list
-    const rowsWithLogos = await Promise.all(result.rows.map(async (job) => {
-      const j = { ...job };
-      try {
-        if (j.companyLogo) {
-          const signed = await createSignedUrl(BUCKET_NAME, j.companyLogo, 3600);
-          j.companyLogo = signed.data?.signedUrl || j.companyLogo;
-        }
-      } catch (err) {
-        console.warn('Failed to create signed URL for company logo:', err);
-      }
-      return j;
-    }));
-
-    res.json({
-      success: true,
-      jobs: rowsWithLogos.map(job => ({
-        ...job,
-        postedAt: job.created_at,
-        salaryMin: job.salary_min,
-        salaryMax: job.salary_max,
-        employmentType: job.employment_type,
-        requiredSkills: job.required_skills || [],
-        applicationsCount: parseInt(job.applicationsCount) || 0,
-        viewsCount: parseInt(job.viewsCount) || 0
-      }))
-    });
-  } catch (error) {
-    console.error('Error fetching jobs:', error);
-    res.status(500).json({ success: false, message: 'Error fetching jobs' });
   }
 });
 
